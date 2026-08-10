@@ -1,0 +1,59 @@
+/* base.qss – common structure, no hardcoded colors */
+QMainWindow {
+    background-color: $main-bg;
+}
+
+QWidget {
+    font-family: 'Inter', 'Segoe UI', Roboto, sans-serif;
+    font-size: 15px;
+    color: $text-primary;
+}
+
+/* Sidebar */
+#sidebar {
+    background-color: $sidebar-bg;
+    border-right: 1px solid $border-color;
+}
+
+/* Header */
+#header {
+    background-color: $header-bg;
+    border-bottom: 1px solid $border-color;
+}
+
+/* Content Widget */
+#contentWidget {
+    background-color: $content-bg;
+}
+
+/* Buttons */
+QPushButton {
+    border: none;
+    padding: 10px 16px;
+    border-radius: 8px;
+    background-color: $button-bg;
+    color: $button-text;
+    text-align: left;
+}
+
+QPushButton:hover {
+    background-color: $button-hover;
+}
+
+QPushButton:checked {
+    background-color: $button-active;
+    color: white;
+}
+
+/* Inputs */
+QLineEdit {
+    border: 1px solid $input-border;
+    border-radius: 8px;
+    padding: 10px 12px;
+    background-color: $input-bg;
+    color: $input-text;
+}
+
+QLineEdit:focus {
+    border: 2px solid $primary;
+}

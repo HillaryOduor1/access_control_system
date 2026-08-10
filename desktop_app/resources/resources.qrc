@@ -1,0 +1,17 @@
+<RCC>
+  <qresource>
+    <file>icons/hill_icon.jpg</file>
+    <file>icons/dashboard1.png</file>
+    <file>icons/dashboard2.png</file>
+    <file>icons/home1.png</file>
+    <file>icons/home2.png</file>
+    <file>icons/logout1.png</file>
+    <file>icons/logout2.png</file>
+    <file>icons/settings1.png</file>
+    <file>icons/settings2.png</file>
+    <file>icons/students1.png</file>
+    <file>icons/students2.png</file>
+    <file>icons/teacher1.png</file>
+    <file>icons/teacher2.png</file>
+  </qresource>
+</RCC>

@@ -1,0 +1,75 @@
+/* dark.qss – 60-30-10, HSL,*/
+$main-bg: hsl(240, 20%, 10%);
+$sidebar-bg: hsl(240, 18%, 15%);
+$header-bg: hsl(240, 18%, 15%);
+$content-bg: hsl(240, 20%, 10%);
+$text-primary: hsl(0, 0%, 95%);
+$text-secondary: hsl(240, 10%, 70%);
+$text-muted: hsl(240, 8%, 60%);
+$primary: hsl(150, 70%, 40%);         /* lighter green for dark mode */
+$secondary: hsl(142, 70%, 45%);
+$accent: hsl(0, 72%, 55%);
+$border-color: hsl(240, 12%, 28%);
+$grid-color: hsl(240, 14%, 22%);
+$button-bg: hsl(150, 70%, 40%);
+$button-hover: hsl(150, 70%, 45%);
+$button-active: hsl(150, 70%, 40%);
+$button-text: hsl(0, 0%, 100%);
+$input-bg: hsl(240, 18%, 15%);
+$input-text: hsl(0, 0%, 95%);
+$input-border: hsl(240, 12%, 28%);
+$table-bg: hsl(240, 15%, 18%);
+$card-bg: hsl(240, 15%, 18%);
+
+/* Additional dark theme styles */
+QLabel#dashboardTitle {
+    font-size: 24px;
+    font-weight: bold;
+    color: $text-primary;
+}
+
+QFrame.card {
+    background-color: $card-bg;
+    border: 1px solid $border-color;
+    border-radius: 12px;
+    padding: 20px;
+}
+
+QLabel.card-title {
+    font-size: 12px;
+    color: $text-secondary;
+}
+
+QLabel.card-value {
+    font-size: 28px;
+    font-weight: bold;
+    color: $text-primary;
+}
+
+QLabel.card-change.positive {
+    color: $secondary;
+    font-weight: bold;
+}
+
+QLabel.card-change.negative {
+    color: $accent;
+    font-weight: bold;
+}
+
+QLabel.card-change.neutral {
+    color: $text-muted;
+    font-weight: bold;
+}
+
+QTableWidget#recentActivityTable {
+    background-color: $table-bg;
+    border: 1px solid $border-color;
+    border-radius: 12px;
+}
+
+QHeaderView::section {
+    background-color: transparent;
+    padding: 12px;
+    color: $text-secondary;
+    font-weight: bold;
+}
