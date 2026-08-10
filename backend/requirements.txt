@@ -1,12 +1,11 @@
-fastapi==0.104.1
+fastapi==0.95.2
 uvicorn[standard]==0.24.0
 motor==3.3.2
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 bcrypt==4.1.1
 python-dotenv==1.0.0
-pydantic==2.5.0
+pydantic==1.10.13
 pymongo==4.5.0
 email-validator==2.1.1
 python-multipart==0.0.32
-pydantic-core @ https://github.com/pydantic/pydantic-core/releases/download/v2.14.1/pydantic_core-2.14.1-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
