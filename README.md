@@ -1,349 +1,613 @@
-# 🏫 School Management System - Desktop Application
-## to run the app
-frontend; first start the virtual env by running .\venv\scripts\activate
-Then to run the backend run .\venv_backend\scripts\activate then start backend server uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+# ICT Access Control System
 
-A modern, feature-rich desktop application for managing school operations built with Python and PySide6.
+A comprehensive access control and management system for the ICT Authority, featuring a modern desktop application with a FastAPI backend and MongoDB database.
 
-![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)
-![PySide6](https://img.shields.io/badge/PySide6-6.5+-green.svg)
-![License](https://img.shields.io/badge/License-MIT-yellow.svg)
-![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)
+## Table of Contents
 
-## 📋 Features
+* [Overview](#overview)
+* [Features](#features)
 
-### 🎨 Modern User Interface
+  * [Authentication and Security](#authentication-and-security)
+  * [User Management](#user-management)
+  * [Access Control](#access-control)
+  * [System Features](#system-features)
+* [Tech Stack](#tech-stack)
 
-- **Dark/Light Theme Toggle** - Switch between themes with one click
-- **Responsive Design** - Adapts to different window sizes
-- **Clean Dashboard** - Modern card-based statistics display
-- **Intuitive Navigation** - Easy-to-use sidebar menu
+  * [Frontend - Desktop Application](#frontend---desktop-application)
+  * [Backend - API](#backend---api)
+* [Project Structure](#project-structure)
+* [Prerequisites](#prerequisites)
+* [Installation](#installation)
 
-### 📊 Dashboard
+  * [Backend Setup](#backend-setup)
+  * [Desktop App Setup](#desktop-app-setup)
+* [Configuration](#configuration)
 
-- Real-time statistics overview
-- Four key metrics cards:
-  - Total Students
-  - Active Classes
-  - Total Teachers
-  - Pending Fees
-- Recent activity tracking table
-- Percentage change indicators (positive/negative/neutral)
+  * [Environment Variables](#environment-variables)
+  * [MongoDB Configuration](#mongodb-configuration)
+  * [JWT Configuration](#jwt-configuration)
+  * [Email Configuration](#email-configuration)
+  * [Application Configuration](#application-configuration)
+  * [Desktop App Configuration](#desktop-app-configuration)
+* [Running the Application](#running-the-application)
 
-### 🔧 Technical Features
+  * [Quick Start](#quick-start)
+  * [Default Credentials](#default-credentials)
+* [Deployment](#deployment)
 
-- Modular architecture with separate components
-- Theme manager with CSS-based styling
-- Object-oriented design patterns
-- Custom widget system
-- Data persistence ready
+  * [Deploy Backend to Render](#deploy-backend-to-render)
+  * [Build Desktop Application](#build-desktop-application)
+* [API Documentation](#api-documentation)
 
-## 🚀 Getting Started
+  * [Swagger UI](#swagger-ui)
+  * [ReDoc](#redoc)
+  * [Main API Endpoints](#main-api-endpoints)
+* [Contributing](#contributing)
 
-### Prerequisites
+  * [Development Workflow](#development-workflow)
+  * [Coding Standards](#coding-standards)
+* [License](#license)
+* [Authors](#authors)
+* [Acknowledgments](#acknowledgments)
+* [Support](#support)
 
-- Python 3.8 or higher
-- pip (Python package manager)
+## Overview
 
-### Installation
+The ICT Access Control System is a desktop-based application designed to manage and monitor access control for the ICT Authority. It provides a secure, user-friendly interface for managing employees, visitors, access logs, and system configurations.
 
-1. **Clone the repository**
+### Key Capabilities
+
+* Secure authentication with JWT tokens
+* Real-time access monitoring
+* Employee and visitor management
+* Role-based access control (RBAC)
+* Offline support with data synchronization
+* Comprehensive audit logging
+* Theme support for Light and Dark modes
+
+## Features
+
+### Authentication and Security
+
+* **Secure Login:** JWT-based authentication with token storage
+* **Password Reset:** OTP-based password recovery via email
+* **Role-Based Access:** Admin, Manager, and Staff roles with different permissions
+* **Session Management:** Remember-me functionality
+
+### User Management
+
+* **Employee Management:** Add, edit, delete, and view employees
+* **Visitor Management:** Track visitors with check-in and check-out
+* **User Accounts:** Manage user accounts and permissions
+
+### Access Control
+
+* **Access Logs:** Real-time logging of all access attempts
+* **Field Configuration:** Customizable form fields
+* **Reports:** Generate and export access reports
+
+### System Features
+
+* **Offline Mode:** Works offline with data synchronization when the connection is restored
+* **Theme Support:** Light and Dark modes with automatic theme detection
+* **Data Export:** Export logs and reports in various formats
+* **Audit Trail:** Complete audit logging for all actions
+
+## Tech Stack
+
+### Frontend - Desktop Application
+
+* **Python 3.11+**
+* **PySide6** - Qt6 bindings for Python
+* **SQLite** - Local database for offline mode
+* **Keyring** - Secure credential storage
+* **HTTPX** - Async HTTP client
+* **Custom Components** - Shadcn-inspired design system
+
+### Backend - API
+
+* **Python 3.11+**
+* **FastAPI** - Modern web framework
+* **MongoDB** - Primary database
+* **Motor** - Async MongoDB driver
+* **PyJWT** - JWT token handling
+* **Bcrypt** - Password hashing
+* **Uvicorn** - ASGI server
+
+## Project Structure
+
+```text
+access-control-system-python/
+├── backend/                          # FastAPI Backend
+│   ├── app/
+│   │   ├── models/                  # MongoDB models
+│   │   ├── routes/                  # API endpoints
+│   │   ├── schemas/                 # Pydantic schemas
+│   │   ├── services/                # Business logic
+│   │   ├── config.py                # Configuration settings
+│   │   ├── main.py                  # FastAPI application entry point
+│   │   └── seed.py                  # Database seeding script
+│   ├── .env.example                 # Environment variables template
+│   └── requirements.txt             # Backend dependencies
+│
+├── desktop_app/                     # PySide6 Desktop Application
+│   ├── assets/
+│   │   ├── icons/                   # SVG icons
+│   │   └── images/                  # Logo and background images
+│   ├── core/                        # Core functionality
+│   │   ├── api_client.py            # HTTP API client
+│   │   ├── auth_manager.py          # Authentication management
+│   │   ├── theme_manager.py         # Theme handling
+│   │   ├── icon_manager.py          # Icon management
+│   │   └── sync_manager.py          # Offline sync management
+│   ├── database/
+│   │   └── db_manager.py            # SQLite database operations
+│   ├── dialogs/                     # Dialog windows
+│   │   ├── reset_password_dialog.py
+│   │   └── visitor_checkout_dialog.py
+│   ├── pages/                       # Main application pages
+│   │   ├── login_page.py
+│   │   ├── dashboard_page.py
+│   │   ├── employees_page.py
+│   │   ├── visitors_page.py
+│   │   ├── access_logs_page.py
+│   │   └── settings_page.py
+│   ├── widgets/                     # Reusable UI components
+│   │   ├── components.py            # Custom widgets
+│   │   ├── sidebar.py               # Navigation sidebar
+│   │   ├── header.py                # Application header
+│   │   └── floating_label_input.py
+│   ├── themes/                      # QSS stylesheets
+│   │   ├── base.qss
+│   │   ├── light.qss
+│   │   └── dark.qss
+│   ├── utils/                       # Utility functions
+│   │   ├── path_utils.py            # Path handling
+│   │   └── access_control.py        # Permission utilities
+│   ├── main.py                      # Application entry point
+│   ├── config.py                    # App configuration
+│   └── requirements.txt             # App dependencies
+│
+├── .env.example                     # Environment template
+└── .gitignore                       # Git ignore file
+```
+
+## Prerequisites
+
+Before installing the system, ensure the following are available:
+
+* **Python** 3.11 or higher
+* **MongoDB** 4.4 or higher, either local or MongoDB Atlas
+* **Git** for version control
+
+## Installation
+
+### Backend Setup
+
+#### Clone the Repository
 
 ```bash
-git clone https://github.com/yourusername/school-management-system.git
-cd school-management-system
-2. ** Create a virtual environment (recommended)**
-# On Windows
+git clone https://github.com/HillaryOduor1/icta_access_control_system.git
+cd icta_access_control_system/backend
+```
+
+#### Create and Activate a Virtual Environment
+
+##### Windows
+
+```powershell
 python -m venv venv
 venv\Scripts\activate
+```
 
-# On macOS/Linux
+##### Linux and macOS
+
+```bash
 python3 -m venv venv
 source venv/bin/activate
+```
 
-3. install dependencies
-pip install PySide6
+#### Install Dependencies
 
-4.Run the application
+```bash
+pip install -r requirements.txt
+```
+
+#### Set Up Environment Variables
+
+Copy the example environment file:
+
+```bash
+cp .env.example .env
+```
+
+Then edit `.env` with your configuration.
+
+Required variables include:
+
+* `ATLAS_URI` - MongoDB connection string
+* `DB_NAME` - Database name
+* `SECRET_KEY` - JWT secret key
+* `SMTP_*` - Email configuration for OTP functionality
+
+For example, a secure secret key can be generated with:
+
+```bash
+openssl rand -hex 32
+```
+
+#### Seed the Database
+
+Database seeding is optional.
+
+```bash
+python -c "from app.seed import seed_database; seed_database()"
+```
+
+#### Run the Backend Server
+
+```bash
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+The API will be available at:
+
+`http://localhost:8000`
+
+### Desktop App Setup
+
+#### Navigate to the Desktop Application
+
+From the backend directory:
+
+```bash
+cd ../desktop_app
+```
+
+#### Create and Activate a Virtual Environment
+
+##### Windows
+
+```powershell
+python -m venv venv
+venv\Scripts\activate
+```
+
+##### Linux and macOS
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+```
+
+#### Install Dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+#### Configure the API Endpoint
+
+Open:
+
+```text
+core/api_client.py
+```
+
+Update the `base_url` to point to your backend.
+
+##### Development
+
+```python
+client = APIClient(base_url="http://localhost:8000")
+```
+
+##### Production
+
+```python
+client = APIClient(base_url="https://your-api-domain.com")
+```
+
+#### Run the Application
+
+```bash
 python main.py
+```
 
-📁 Project Structure
-school-management-system/
-├── main.py                    # Application entry point
-├── config.py                  # Configuration settings
-├── data/
-│   └── app_data.json         # Application data storage
-├── core/
-│   ├── __init__.py
-│   ├── app.py                # Main application window
-│   └── theme_manager.py      # Theme management system
-├── pages/
-│   ├── __init__.py
-│   ├── base_page.py          # Base page class
-│   ├── dashboard_page.py     # Dashboard page implementation
-│   └── students_page.py      # Students management page
-├── widgets/
-│   ├── __init__.py
-│   ├── sidebar.py            # Sidebar navigation
-│   └── header.py             # Application header
-├── themes/
-│   ├── dark.qss              # Dark theme styles
-│   └── light.qss             # Light theme styles
-└── utils/
-    ├── __init__.py
-    └── data_loader.py        # Data loading utilities
+## Configuration
 
-Key Components
-1. Main Application (core/app.py)
+### Environment Variables
 
-    Creates the main window
+The backend uses environment variables for database, authentication, email, and application configuration.
 
-    Manages navigation between pages
+### MongoDB Configuration
 
-    Handles window geometry and positioning
+```env
+ATLAS_URI=mongodb+srv://username:password@cluster.mongodb.net/
+DB_NAME=icta_access_control
+```
 
-    Integrates theme system
+### JWT Configuration
 
-2. Theme Manager (core/theme_manager.py)
+```env
+SECRET_KEY=your-secret-key-here
+ALGORITHM=HS256
+ACCESS_TOKEN_EXPIRE_MINUTES=30
+REFRESH_TOKEN_EXPIRE_DAYS=7
+```
 
-    Handles dark/light theme switching
+### Email Configuration
 
-    CSS-based styling system
+Email configuration is used for OTP-based password recovery.
 
-    Dynamic style application
+```env
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=your-email@gmail.com
+SMTP_PASSWORD=your-app-password
+SMTP_FROM=your-email@gmail.com
+```
 
-    Fallback styling support
+### Application Configuration
 
-3. Dashboard Page (pages/dashboard_page.py)
+```env
+DEV_MODE=true
+LOG_LEVEL=INFO
+```
 
-    Displays key statistics in card format
+### Desktop App Configuration
 
-    Shows recent activity in a table
+Desktop application configuration is managed through `config.py`.
 
-    Responsive grid layout
+#### Development API Configuration
 
-    Custom card widgets with icons
+```python
+API_URL = "http://localhost:8000"
+```
 
-4. Sidebar Navigation
+#### Production API Configuration
 
-    Collapsible menu
+```python
+API_URL = "https://your-api.onrender.com"
+```
 
-    Active state highlighting
+Additional application settings:
 
-    Icon support
+```python
+THEME = "system"
+OFFLINE_MODE = True
+```
 
-    Smooth navigation
+The supported theme values are:
 
-🎨 UI Features
-Themes
+* `light`
+* `dark`
+* `system`
 
-    Light Theme: Clean, professional look for daytime use
+## Running the Application
 
-    Dark Theme: Eye-friendly dark mode for extended use
+### Quick Start
 
-    Customizable: Easy to add new themes via CSS
+#### Start the Backend
 
-Dashboard Cards
+From the project root:
 
-    Colored icons for quick recognition
+```bash
+cd backend
+```
 
-    Large, readable values
+Activate the virtual environment.
 
-    Trend indicators with color coding
+##### Linux and macOS
 
-    Hover effects for interactivity
+```bash
+source venv/bin/activate
+```
 
-Table Features
+##### Windows
 
-    Alternating row colors for readability
+```powershell
+venv\Scripts\activate
+```
 
-    Clean, modern borders
+Start the server:
 
-    Responsive column sizing
+```bash
+uvicorn app.main:app --reload --port 8000
+```
 
-    Selection highlighting
+#### Start the Desktop Application
 
-🛠️ Development
-Adding New Pages
+Open a new terminal and run:
 
-    Create a new file in pages/ directory
+```bash
+cd desktop_app
+```
 
-    Extend the QWidget class
+Activate the virtual environment.
 
-    Implement your UI in the init_ui() method
+##### Linux and macOS
 
-    Add navigation entry in core/app.py
+```bash
+source venv/bin/activate
+```
 
-Customizing Themes
+##### Windows
 
-    Edit CSS files in themes/ directory
+```powershell
+venv\Scripts\activate
+```
 
-    Add new color variables
+Then start the application:
 
-    Apply styles to widget classes
+```bash
+python main.py
+```
 
-    Test theme switching
+### Default Credentials
 
-Extending Functionality
+After seeding the database, you can log in with the default development credentials.
 
-    Add new data models in models/ directory
+| Field    | Value       |
+| -------- | ----------- |
+| Username | `admin`     |
+| Password | `Admin@123` |
 
-    Create custom widgets in widgets/ directory
+> **Security note:** Change or disable default credentials before deploying the system to a production environment.
 
-    Implement utilities in utils/ directory
+## Deployment
 
-    Add data persistence in data/ directory
+### Deploy Backend to Render
 
-📝 Usage Guide
-Navigation
+The backend can be deployed to Render as a web service.
 
-    Use the sidebar to switch between different sections
+#### Push the Code to GitHub
 
-    The active page is highlighted in the sidebar
+Ensure the project has been committed and pushed to your GitHub repository.
 
-    Page title updates automatically in the header
+#### Create a Render Web Service
 
-Theme Switching
+Create a new Web Service on Render and connect it to the GitHub repository.
 
-    Click the theme toggle button in the sidebar
+#### Configure the Build Command
 
-    Button shows current theme (🌙 for dark, ☀️ for light)
+```bash
+pip install -r requirements.txt
+```
 
-    Styles apply immediately without restart
+#### Configure the Start Command
 
-Dashboard
+```bash
+uvicorn app.main:app --host 0.0.0.0 --port $PORT
+```
 
-    View key metrics at a glance
+#### Configure Environment Variables
 
-    Check percentage changes for trends
+Add the required environment variables through the Render dashboard.
 
-    Review recent activities in the table
+#### Deploy
 
-    Click "View All" for detailed activity logs
+Deploy the service. Render will build and deploy the backend using the configured commands.
 
-Code Examples
-Creating a Card Widget
-def create_card(self, title, value, change, change_type, icon):
-    card = QFrame()
-    card.setObjectName("card")
+### Build Desktop Application
 
-    # Add icon, title, value, and change label
-    # Apply styling via QSS classes
+The desktop application can be packaged into a Windows executable using PyInstaller.
 
-    return card
+#### Install PyInstaller
 
-Theme Switching
-def toggle_theme(self):
-    self.theme_manager.toggle_theme()
-    self.apply_theme()
+```bash
+pip install pyinstaller
+```
 
-Navigation
-def navigate_to(self, page_name):
-    self.page_title.setText(page_name.capitalize())
-    self.content_stack.setCurrentIndex(page_index)
+#### Build the Executable
 
-Troubleshooting
-Common Issues
+From the `desktop_app` directory:
 
-    "ModuleNotFoundError: No module named 'PySide6'"
+```powershell
+pyinstaller --name="ICTA-Access-Control" --windowed --onefile --add-data "assets;assets" --add-data "themes;themes" main.py
+```
 
-        Run: pip install PySide6
+The generated executable will be placed in:
 
-    "Could not parse stylesheet" errors
+```text
+dist/
+```
 
-        Check CSS syntax in theme files
+> **Note:** The `--add-data` syntax shown above is intended for Windows. PyInstaller uses a different separator on Linux and macOS.
 
-        Ensure no missing semicolons or brackets
+## API Documentation
 
-    Window not showing
+Once the backend is running, interactive API documentation is available through FastAPI.
 
-        Check if window.show() is called
+### Swagger UI
 
-        Verify no exceptions in initialization
+`http://localhost:8000/docs`
 
-    Theme toggle not working
+### ReDoc
 
-        Ensure theme files exist in themes/ directory
+`http://localhost:8000/redoc`
 
-        Check button connection in app.py
+### Main API Endpoints
 
-Debug Mode
+| Endpoint                | Method                 | Description                           |
+| ----------------------- | ---------------------- | ------------------------------------- |
+| `/auth/login`           | `POST`                 | User login with username and password |
+| `/auth/forgot-password` | `POST`                 | Request password reset OTP            |
+| `/auth/verify-otp`      | `POST`                 | Verify OTP and obtain reset token     |
+| `/auth/reset-password`  | `POST`                 | Reset password using a reset token    |
+| `/auth/refresh`         | `POST`                 | Refresh JWT token                     |
+| `/users`                | `GET`                  | List users; admin access required     |
+| `/users/{id}`           | `GET`, `PUT`, `DELETE` | Manage an individual user             |
+| `/employees`            | `GET`, `POST`          | Employee management                   |
+| `/visitors`             | `GET`, `POST`          | Visitor management                    |
+| `/access-logs`          | `GET`                  | Access logs with filters              |
+| `/sync`                 | `POST`                 | Synchronize offline data              |
 
-Run with verbose output:
-bash
+## Contributing
 
-python main.py --debug
+Contributions should follow the project's existing development standards.
 
-📈 Future Enhancements
-Planned Features
+### Development Workflow
 
-    Student management system
+#### Fork the Repository
 
-    Teacher management system
+Create your own fork of the project.
 
-    Class scheduling
+#### Create a Feature Branch
 
-    Fee payment tracking
+```bash
+git checkout -b feature/amazing-feature
+```
 
-    Report generation
+#### Commit Your Changes
 
-    Data import/export
+```bash
+git commit -m "Add amazing feature"
+```
 
-    User authentication
+#### Push the Feature Branch
 
-    Database integration
+```bash
+git push origin feature/amazing-feature
+```
 
-    Backup system
+#### Open a Pull Request
 
-Technical Improvements
+Create a Pull Request against the appropriate project branch.
 
-    Unit tests
+### Coding Standards
 
-    Documentation
+* Follow PEP 8 guidelines.
+* Use type hints.
+* Write docstrings for functions.
+* Keep UI components reusable.
+* Maintain clear separation between UI, business logic, database, and API functionality.
 
-    Performance optimization
+## License
 
-    Multi-language support
+This project is proprietary software.
 
-    Plugin system
+All rights reserved.
 
-🤝 Contributing
+## Authors
 
-    Fork the repository
+**Hillary Oduor** - Initial Development
 
-    Create a feature branch (git checkout -b feature/AmazingFeature)
+## Acknowledgments
 
-    Commit your changes (git commit -m 'Add some AmazingFeature')
+This project uses and is supported by the following technologies and design systems:
 
-    Push to the branch (git push origin feature/AmazingFeature)
+* **PySide6** for Qt6 bindings for Python
+* **FastAPI** for the web framework
+* **MongoDB** for database storage
+* **shadcn/ui** for design-system inspiration
 
-    Open a Pull Request
+## Support
 
-Development Guidelines
+For support, email:
 
-    Follow PEP 8 style guide
+`support@icta.go.ke`
 
-    Write meaningful commit messages
-
-    Add comments for complex logic
-
-    Update documentation for new features
-
-📄 License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-🙏 Acknowledgments
-
-    PySide6 - Qt for Python bindings
-
-    Qt Company - Qt framework
-
-    Python Software Foundation - Python programming language
-
- Support
-
-For support, email: support@example.com or open an issue on GitHub.
-
-Note: This is a demo application. For production use, additional security measures and data validation should be implemented.
+You can also open an issue in the project's GitHub repository.
 
 
