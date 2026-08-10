@@ -1,0 +1,2 @@
+[tool.pip]
+prefer-binary = true
