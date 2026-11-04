@@ -1,4 +1,4 @@
-# ICT Authority Kenya - Access Control System Prototype
+# Access Control System Prototype
 
 This is a proof-of-concept/prototype access control system developed for 
 demonstration purposes to showcase implementable concepts and technical skill.
