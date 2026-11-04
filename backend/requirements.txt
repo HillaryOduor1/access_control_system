@@ -1,11 +1,39 @@
-fastapi==0.115.12
-uvicorn[standard]==0.34.0
-motor==3.7.1
+# backend/requirements.txt
+# Access Control System - Backend API Server
+# Python 3.11+ required
+
+# WEB FRAMEWORK - COMPATIBLE VERSIONS
+
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+starlette==0.27.0
+
+# DATABASE - COMPATIBLE VERSIONS (bson is included with pymongo)
+
+motor==3.3.2
+pymongo==4.6.1
+
+# AUTHENTICATION & SECURITY
+
 python-jose[cryptography]==3.3.0
+cryptography==41.0.7
 passlib[bcrypt]==1.7.4
 bcrypt==4.1.1
+email-validator==2.3.0
+python-multipart==0.0.29
+
+# CONFIGURATION
 python-dotenv==1.0.0
-pydantic==2.10.6
-pymongo==4.10.1
-email-validator==2.1.1
-python-multipart==0.0.20
+
+# DATA VALIDATION
+
+pydantic==2.5.0
+pydantic-core==2.14.1
+annotated-types==0.6.0
+
+# UTILITIES
+
+httpx==0.28.1
+werkzeug==3.0.6
+idna==3.18
+six==1.17.0

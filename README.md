@@ -1,6 +1,6 @@
-# ICT Access Control System
+# Access Control System
 
-A comprehensive access control and management system for the ICT Authority, featuring a modern desktop application with a FastAPI backend and MongoDB database.
+A comprehensive access control and management system , featuring a modern desktop application with a FastAPI backend and MongoDB database.
 
 ## Table of Contents
 
@@ -53,7 +53,7 @@ A comprehensive access control and management system for the ICT Authority, feat
 
 ## Overview
 
-The ICT Access Control System is a desktop-based application designed to manage and monitor access control for the ICT Authority. It provides a secure, user-friendly interface for managing employees, visitors, access logs, and system configurations.
+The Access Control System is a desktop-based application designed to manage and monitor access control. It provides a secure, user-friendly interface for managing employees, visitors, access logs, and system configurations.
 
 ### Key Capabilities
 

@@ -1,0 +1,8 @@
+{
+  "version": "1.2.6",
+  "min_supported": "1.0.0",
+  "url": "https://REPLACE-WITH-YOUR-HOST/Access_Control_System_1.2.6_Payload.exe",
+  "sha256": "paste-the-sha256-here",
+  "notes": "What changed in this release.",
+  "mandatory": false
+}

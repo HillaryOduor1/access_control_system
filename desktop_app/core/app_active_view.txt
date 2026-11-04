@@ -1,0 +1,3025 @@
+"""Main application window and orchestration layer for Access Control System."""
+import logging
+import time
+from typing import Optional, Dict, List, Any
+from PySide6.QtWidgets import (
+    QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
+    QStackedWidget, QApplication, QMessageBox
+)
+from PySide6.QtCore import Qt, QTimer, Signal
+from widgets.sidebar import Sidebar
+from widgets.header import Header
+from core.theme_manager import ThemeManager
+from pages.dashboard_page import DashboardPage
+from pages.visitors_page import VisitorsPage
+from pages.employees_page import EmployeesPage
+from pages.access_logs_page import AccessLogsPage
+from pages.field_config_page import FieldConfigPage
+from pages.report_page import ReportPage
+from pages.settings_page import SettingsPage
+from database.db_manager import DatabaseManager
+from config import Config
+from widgets.components import ShadcnToast
+from core.api_client import APIClient
+from core.auth_manager import AuthManager
+from core.data_service import DataService
+from core.sync_manager import SyncManager
+from core.env_manager import EnvironmentManager
+logger = logging.getLogger(__name__)
+class MainApp(QMainWindow):
+    """
+    Main application window managing the authenticated session.
+    Lifecycle contract:
+      - Constructed hidden during splash loading.
+      - The login page is installed as index 0 of a persistent root stack.
+      - The window is shown exactly once by the ApplicationLoader after
+        the splash finishes.
+      - On successful login, the dashboard is added as a second widget of
+        the root stack and the stack switches index. The window is NOT
+        hidden, NOT re-shown, and NOT resized.
+      - On logout, the dashboard is removed and the login page is restored.
+    Anti-flicker contract
+    ---------------------
+    Two rules govern the login -> dashboard transition:
+    1.  NEVER call `QApplication.processEvents()` while `build_main_ui()`
+        is assembling the dashboard tree.
+        Calling `processEvents()` mid-build lets Windows DWM composite
+        the partially-built dashboard — with its QLabels and cards
+        already positioned at their final screen coordinates — on top
+        of the still-visible login page. The user perceives this as a
+        small blank window flickering at the coordinates where the new
+        content is about to appear.
+    2.  NEVER hide or unparent the login page during the swap.
+        The login page contains widgets that hold native child HWNDs
+        on Windows (gradient-styled QFrames, scaled QLabels). Destroying
+        or reparenting them in the same event-loop iteration as the
+        stack-index change causes the DWM to composite a ghost frame
+        at the child HWND's last geometry.
+        Qt hides non-current stack pages automatically. We delete the
+        login page on a delayed tick, well after the dashboard's first
+        paint has landed.
+    """
+    logout_requested = Signal()
+    connection_changed = Signal(bool)
+    def __init__(self):
+        super().__init__()
+        self._is_closing = False
+        self._is_logging_out = False
+        self._ui_initialized = False
+        self._is_shown = False
+        self._is_transitioning = False
+        self.theme_manager = ThemeManager()
+        self.theme_manager.register_widget(
+            self,
+            on_theme_changed=self._on_theme_changed,
+        )
+        self.db = DatabaseManager()
+        self.env_manager = EnvironmentManager()
+        self.api_client = APIClient(self.env_manager.get_base_url())
+        self.env_manager.env_changed.connect(self._on_env_changed)
+        self.sync_manager: Optional[SyncManager] = None
+        self.data_service: Optional[DataService] = None
+        self.auth_manager: Optional[AuthManager] = None
+        self.current_user: Optional[Dict[str, Any]] = None
+        self.permissions: List[str] = []
+        self.main_central_widget: Optional[QWidget] = None
+        self.pages: Dict[str, QWidget] = {}
+        self.stack: Optional[QStackedWidget] = None
+        self.sidebar: Optional[Sidebar] = None
+        self.header: Optional[Header] = None
+        self.login_page: Optional[QWidget] = None
+        self.sync_timer: Optional[QTimer] = None
+        self.root_stack = QStackedWidget()
+        self.root_stack.setObjectName("rootStack")
+        self.setCentralWidget(self.root_stack)
+        self._apply_window_sizing()
+        self.show_login_page(show_window=False)
+    def _apply_window_sizing(self):
+        """Apply window sizing based on configuration."""
+        self.setMinimumSize(Config.MIN_WIDTH, Config.MIN_HEIGHT)
+        if Config.START_MAXIMIZED:
+            self.setWindowState(Qt.WindowState.WindowMaximized)
+            logger.debug("Window starting maximized")
+        else:
+            geom = Config.get_window_geometry_for_startup()
+            if geom:
+                x, y, width, height = geom
+                self.setGeometry(x, y, width, height)
+                logger.debug(f"Window geometry set to: {width}x{height} at ({x}, {y})")
+            else:
+                self.resize(Config.INITIAL_WIDTH, Config.INITIAL_HEIGHT)
+                self.center_window()
+                logger.debug("Window using fallback geometry")
+    def _lazy_init_services(self):
+        if self._is_closing:
+            return
+        if self.sync_manager is None:
+            logger.info("Initializing backend services...")
+            try:
+                _t = time.perf_counter()
+                self.sync_manager = SyncManager(self.api_client, self.db)
+                logger.critical(f"INIT TIMING | SyncManager()           = {(time.perf_counter()-_t)*1000:.1f} ms")
+                _t = time.perf_counter()
+                self.sync_manager.start()
+                logger.critical(f"INIT TIMING | SyncManager.start()     = {(time.perf_counter()-_t)*1000:.1f} ms")
+                _t = time.perf_counter()
+                self.data_service = DataService(self.api_client, self.db, self.sync_manager)
+                logger.critical(f"INIT TIMING | DataService()           = {(time.perf_counter()-_t)*1000:.1f} ms")
+                self.api_client.connection_changed.connect(self._on_connection_changed)
+                self._setup_auto_sync()
+                logger.info("Services initialized successfully")
+            except Exception as e:
+                logger.error(f"Failed to initialize services: {e}")
+                self._show_toast(
+                    "Service Initialization",
+                    "Some services failed to initialize. Some features may be limited.",
+                    "warning",
+                )
+    def _show_toast(self, title: str, message: str, variant: str = "default"):
+        """Show a toast on the next event-loop tick, unless suppressed."""
+        if self._is_closing or self._is_transitioning:
+            return
+        if ShadcnToast.is_suppressed():
+            return
+        try:
+            QTimer.singleShot(
+                0,
+                lambda t=title, m=message, v=variant: ShadcnToast(
+                    t, m, variant=v, parent=self
+                ),
+            )
+        except Exception as e:
+            logger.error(f"Failed to schedule toast: {e}")
+    def _on_theme_changed(self, theme: str):
+        if self._is_closing or self._is_transitioning:
+            return
+        logger.debug("Theme changed: %s", theme)
+        if self.header and hasattr(self.header, "on_theme_changed"):
+            self.header.on_theme_changed(theme)
+        if self.sidebar and hasattr(self.sidebar, "on_theme_changed"):
+            self.sidebar.on_theme_changed(theme)
+        if self.stack:
+            current_page = self.stack.currentWidget()
+            if current_page and hasattr(current_page, "on_theme_changed"):
+                try:
+                    current_page.on_theme_changed(theme)
+                except Exception as e:
+                    logger.debug(f"Error updating page theme: {e}")
+    def _on_env_changed(self, new_url: str):
+        if self._is_closing:
+            return
+        logger.info(f"Environment changed to: {new_url}")
+        self.api_client.base_url = new_url
+        if not self.api_client.health_checks_suspended:
+            self.api_client._background_health_check()
+        if self.current_user and not self._is_transitioning:
+            self._refresh_after_connection_change()
+    def _on_connection_changed(self, online: bool):
+        if self._is_closing or self._is_transitioning:
+            return
+        if online and self.current_user:
+            if self.sync_manager:
+                self.sync_manager.sync()
+            self._refresh_after_connection_change()
+        elif not online:
+            logger.debug("App is offline")
+            self._show_toast(
+                "Offline Mode",
+                "You are offline. Changes will be synced when connection is restored.",
+                "warning",
+            )
+    def _refresh_after_connection_change(self):
+        if self._is_closing or self._is_transitioning:
+            return
+        if hasattr(self, 'stack') and self.stack:
+            current_widget = self.stack.currentWidget()
+            if hasattr(current_widget, 'refresh_data'):
+                try:
+                    current_widget.refresh_data()
+                except Exception as e:
+                    logger.error(f"Error refreshing data: {e}")
+    def _setup_auto_sync(self):
+        if self._is_closing:
+            return
+        self.sync_timer = QTimer(self)
+        self.sync_timer.timeout.connect(self._auto_sync_check)
+        self.sync_timer.start(120000)
+    def _auto_sync_check(self):
+        if self._is_closing or self._is_transitioning:
+            return
+        if self.api_client.is_online() and self.sync_manager:
+            self.sync_manager.sync()
+    def show_login_page(self, show_window: bool = True):
+        """Install the login page as index 0 of the root stack."""
+        if self._is_closing:
+            return
+        if self.login_page is not None:
+            try:
+                self.root_stack.removeWidget(self.login_page)
+                self.login_page.setParent(None)
+                self.login_page.deleteLater()
+            except Exception:
+                pass
+            self.login_page = None
+        from pages.login_page import LoginPage
+        if self.auth_manager is None:
+            self.auth_manager = AuthManager(self.api_client, self.db)
+        self.login_page = LoginPage(auth_manager=self.auth_manager)
+        self.login_page.login_successful.connect(self.on_login_success)
+        self.root_stack.insertWidget(0, self.login_page)
+        self.root_stack.setCurrentIndex(0)
+        self.setWindowTitle("Access Control - Login")
+        if show_window and not self._is_shown:
+            self.show()
+            self.raise_()
+            self.activateWindow()
+            self._is_shown = True
+    def on_login_success(self, user_info: Dict[str, Any]):
+        _t_start = time.perf_counter()
+        if self._is_closing or self._is_transitioning:
+            return
+        logger.info(f"Login successful for user: {user_info.get('username', 'unknown')}")
+        if self._ui_initialized and self.current_user:
+            logger.warning("UI already initialized, ignoring duplicate login signal")
+            return
+        self._is_transitioning = True
+        ShadcnToast.suppress(True)
+        try:
+            self.api_client.suspend_health_checks()
+        except Exception:
+            pass
+        try:
+            if self.auth_manager:
+                self.permissions = list(self.auth_manager.permissions) if self.auth_manager.permissions else []
+                logger.debug(f"Permissions from auth_manager: {self.permissions}")
+            else:
+                self.permissions = ['view_dashboard']
+                logger.warning("Auth manager not available, using fallback permissions")
+            user_info.setdefault('id', user_info.get('username', 'User'))
+            user_info.setdefault('full_name', user_info.get('username', 'User'))
+            user_info.setdefault('email', '')
+            user_info.setdefault('permissions', self.permissions)
+            self.current_user = user_info
+            _t = time.perf_counter()
+            self._lazy_init_services()
+            logger.critical(f"LOGIN TIMING | _lazy_init_services()    = {(time.perf_counter()-_t)*1000:.1f} ms")
+            _t = time.perf_counter()
+            self.build_main_ui(user_info)
+            logger.critical(f"LOGIN TIMING | build_main_ui()          = {(time.perf_counter()-_t)*1000:.1f} ms")
+            _t = time.perf_counter()
+            existing_index = self.root_stack.indexOf(self.main_central_widget)
+            if existing_index < 0:
+                self.root_stack.addWidget(self.main_central_widget)
+            logger.critical(f"LOGIN TIMING | root_stack.addWidget()   = {(time.perf_counter()-_t)*1000:.1f} ms")
+            _t = time.perf_counter()
+            self.root_stack.setCurrentWidget(self.main_central_widget)
+            logger.critical(f"LOGIN TIMING | setCurrentWidget()       = {(time.perf_counter()-_t)*1000:.1f} ms")
+            old_login = self.login_page
+            self.login_page = None
+            _t = time.perf_counter()
+            if not Config.START_MAXIMIZED:
+                geom = Config.get_window_geometry_for_startup()
+                if geom:
+                    x, y, width, height = geom
+                    self.setGeometry(x, y, width, height)
+            if self.isVisible():
+                self.raise_()
+                self.activateWindow()
+            else:
+                self.show()
+                self.raise_()
+                self.activateWindow()
+                self._is_shown = True
+            logger.critical(f"LOGIN TIMING | raise/activate            = {(time.perf_counter()-_t)*1000:.1f} ms")
+            self._ui_initialized = True
+            logger.info("Main UI displayed")
+            if old_login is not None:
+                QTimer.singleShot(400, lambda w=old_login: self._safe_delete_widget(w))
+            logger.critical(f"LOGIN TIMING | TOTAL on_login_success   = {(time.perf_counter()-_t_start)*1000:.1f} ms")
+        finally:
+            QTimer.singleShot(0, self._end_transition)
+    def _safe_delete_widget(self, widget):
+        """
+        Delete a widget after hiding it and letting DWM settle.
+        On Windows, destroying a widget that holds a native child HWND
+        during the same event-loop iteration as a widget-tree swap can
+        cause the DWM to briefly composite a ghost rectangle at the
+        child HWND's last known geometry. By the time we reach this
+        method, the swap is long over and the new content is painted,
+        so the widget can be destroyed safely.
+        """
+        if widget is None:
+            return
+        try:
+            widget.hide()
+        except Exception:
+            pass
+        try:
+            widget.setParent(None)
+        except Exception:
+            pass
+        try:
+            widget.deleteLater()
+        except Exception:
+            pass
+    def _end_transition(self):
+        """Finish the transition on the next tick."""
+        try:
+            user_info = self.current_user or {}
+            user_id = (
+                user_info.get("id")
+                or user_info.get("_id")
+                or user_info.get("username")
+            )
+            self.theme_manager.set_user(str(user_id) if user_id else None)
+        except Exception as e:
+            logger.warning(f"Failed to apply per-user appearance: {e}")
+        self._is_transitioning = False
+        try:
+            self.api_client.resume_health_checks()
+        except Exception:
+            pass
+        ShadcnToast.suppress(False)
+    def build_main_ui(self, user_info: Dict[str, Any]):
+        """
+        Build the dashboard widget tree.
+        ANTI-FLICKER: This method must NOT call QApplication.processEvents()
+        at any point. Doing so lets Windows composite the partially-built
+        dashboard over the still-visible login page, producing the
+        flicker of small blank windows at the coordinates of the new
+        widgets.
+        The tree is built entirely synchronously. The main window may
+        briefly show "(Not Responding)" in its title bar during the
+        build — that is a cosmetic title-bar state, not a content
+        flicker, and is the correct trade-off.
+        """
+        _t0 = time.perf_counter()
+        if self._is_closing:
+            return
+        if self._ui_initialized:
+            logger.debug("UI already built, skipping rebuild")
+            return
+        logger.debug("Building main UI...")
+        logger.debug("Permissions: %s", self.permissions)
+        self.setWindowTitle(f"Access Control System - {user_info['full_name']}")
+        central = QWidget()
+        central.setObjectName("mainCentralWidget")
+        main_layout = QHBoxLayout(central)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+        central.setUpdatesEnabled(False)
+        _t = time.perf_counter()
+        self.sidebar = Sidebar(self.permissions, user_info, self.theme_manager)
+        logger.critical(f"BUILD TIMING | Sidebar.__init__          = {(time.perf_counter()-_t)*1000:.1f} ms")
+        _t = time.perf_counter()
+        self.sidebar.navigation_requested.connect(self.navigate)
+        self.sidebar.toggled.connect(self._on_sidebar_toggled)
+        main_layout.addWidget(self.sidebar)
+        logger.critical(f"BUILD TIMING | Sidebar wiring+add        = {(time.perf_counter()-_t)*1000:.1f} ms")
+        right_panel = QWidget()
+        right_panel.setObjectName("mainRightPanel")
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(0)
+        _t = time.perf_counter()
+        self.header = Header(user_info, self.theme_manager, sidebar_expanded=True)
+        logger.critical(f"BUILD TIMING | Header.__init__           = {(time.perf_counter()-_t)*1000:.1f} ms")
+        _t = time.perf_counter()
+        self.header.menu_toggled.connect(self.sidebar.toggle_collapse)
+        self.header.logout_requested.connect(self.logout)
+        self.header.search_requested.connect(self.global_search)
+        right_layout.addWidget(self.header)
+        logger.critical(f"BUILD TIMING | Header wiring+add         = {(time.perf_counter()-_t)*1000:.1f} ms")
+        self.stack = QStackedWidget()
+        self.stack.setObjectName("mainStack")
+        self.pages = {}
+        _t = time.perf_counter()
+        logger.critical("BUILD TIMING | --- _load_pages() begin ---")
+        self._load_pages()
+        logger.critical(f"BUILD TIMING | _load_pages() TOTAL       = {(time.perf_counter()-_t)*1000:.1f} ms")
+        right_layout.addWidget(self.stack)
+        main_layout.addWidget(right_panel, 1)
+        self.main_central_widget = central
+        central.setUpdatesEnabled(True)
+        logger.critical(f"BUILD TIMING | build_main_ui TOTAL       = {(time.perf_counter()-_t0)*1000:.1f} ms")
+        logger.debug(f"Main UI built. Pages: {list(self.pages.keys())}")
+    def _load_pages(self):
+        """Instantiate every accessible page, instrumented per page."""
+        from pages.dashboard_page import DashboardPage
+        from pages.visitors_page import VisitorsPage
+        from pages.employees_page import EmployeesPage
+        from pages.access_logs_page import AccessLogsPage
+        from pages.field_config_page import FieldConfigPage
+        from pages.report_page import ReportPage
+        from pages.settings_page import SettingsPage
+        logger.debug(f"Loading pages with permissions: {self.permissions}")
+        if 'view_dashboard' in self.permissions or not self.permissions:
+            _t = time.perf_counter()
+            page = DashboardPage(self.current_user, self.permissions, self.data_service)
+            logger.critical(f"BUILD TIMING |   DashboardPage           = {(time.perf_counter()-_t)*1000:.1f} ms")
+            if hasattr(page, 'navigate_requested'):
+                page.navigate_requested.connect(self.navigate)
+            self.pages['dashboard'] = page
+            self.stack.addWidget(page)
+        if self._has_permission(('manage_visitors', 'view_visitors')):
+            _t = time.perf_counter()
+            page = VisitorsPage(self.current_user, self.permissions, self.data_service)
+            logger.critical(f"BUILD TIMING |   VisitorsPage            = {(time.perf_counter()-_t)*1000:.1f} ms")
+            if hasattr(page, 'navigate_requested'):
+                page.navigate_requested.connect(self.navigate)
+            self.pages['visitors'] = page
+            self.stack.addWidget(page)
+        if self._has_permission(('manage_employees', 'view_employees')):
+            _t = time.perf_counter()
+            page = EmployeesPage(self.current_user, self.permissions, self.data_service)
+            logger.critical(f"BUILD TIMING |   EmployeesPage           = {(time.perf_counter()-_t)*1000:.1f} ms")
+            if hasattr(page, 'navigate_requested'):
+                page.navigate_requested.connect(self.navigate)
+            self.pages['employees'] = page
+            self.stack.addWidget(page)
+        if 'view_access_logs' in self.permissions:
+            _t = time.perf_counter()
+            page = AccessLogsPage(self.current_user, self.permissions, self.data_service)
+            logger.critical(f"BUILD TIMING |   AccessLogsPage          = {(time.perf_counter()-_t)*1000:.1f} ms")
+            self.pages['access_logs'] = page
+            self.stack.addWidget(page)
+        if 'configure_fields' in self.permissions:
+            _t = time.perf_counter()
+            page = FieldConfigPage(self.current_user, self.permissions, self.data_service)
+            logger.critical(f"BUILD TIMING |   FieldConfigPage         = {(time.perf_counter()-_t)*1000:.1f} ms")
+            self.pages['field_config'] = page
+            self.stack.addWidget(page)
+        if 'view_reports' in self.permissions:
+            _t = time.perf_counter()
+            page = ReportPage(self.current_user, self.permissions, self.data_service)
+            logger.critical(f"BUILD TIMING |   ReportPage              = {(time.perf_counter()-_t)*1000:.1f} ms")
+            self.pages['reports'] = page
+            self.stack.addWidget(page)
+        if 'manage_settings' in self.permissions:
+            _t = time.perf_counter()
+            page = SettingsPage(
+                self.current_user,
+                self.permissions,
+                self.data_service,
+                env_manager=self.env_manager,
+                api_client=self.api_client,
+            )
+            logger.critical(f"BUILD TIMING |   SettingsPage            = {(time.perf_counter()-_t)*1000:.1f} ms")
+            self.pages['settings'] = page
+            self.stack.addWidget(page)
+        if 'manage_users' in self.permissions:
+            _t = time.perf_counter()
+            from pages.user_management_page import UserManagementPage
+            page = UserManagementPage(self.current_user, self.permissions, self.data_service)
+            logger.critical(f"BUILD TIMING |   UserManagementPage      = {(time.perf_counter()-_t)*1000:.1f} ms")
+            if hasattr(page, 'navigate_requested'):
+                page.navigate_requested.connect(self.navigate)
+            self.pages['users'] = page
+            self.stack.addWidget(page)
+        if self.stack.count() == 0:
+            logger.warning("No pages loaded - showing fallback")
+            from PySide6.QtWidgets import QLabel
+            fallback = QLabel("No permissions assigned.\nPlease contact your administrator.")
+            fallback.setAlignment(Qt.AlignCenter)
+            fallback.setStyleSheet("font-size:18px; color:#64748B; padding:40px;")
+            self.stack.addWidget(fallback)
+        if 'dashboard' in self.pages:
+            self.navigate('dashboard')
+        elif self.pages:
+            first_key = list(self.pages.keys())[0]
+            self.navigate(first_key)
+    def _has_permission(self, perm):
+        if isinstance(perm, tuple):
+            return any(p in self.permissions for p in perm)
+        return perm in self.permissions
+    def navigate(self, page_name: str):
+        if self._is_closing:
+            return
+        if page_name == 'logout':
+            self.logout()
+            return
+        if page_name in self.pages:
+            self.stack.setCurrentWidget(self.pages[page_name])
+            if self.sidebar:
+                self.sidebar.set_active(page_name)
+            if self.header:
+                self.header.set_title(page_name.replace('_', ' ').title())
+    def toggle_theme(self):
+        if self._is_closing:
+            return
+        self.theme_manager.toggle_theme()
+    def _on_sidebar_toggled(self, expanded: bool):
+        if self._is_closing:
+            return
+        if self.header:
+            self.header.set_sidebar_expanded(expanded)
+    def global_search(self, text: str):
+        if self._is_closing:
+            return
+        if self.stack and self.stack.currentWidget():
+            if hasattr(self.stack.currentWidget(), 'filter_table'):
+                self.stack.currentWidget().filter_table(text)
+    def logout(self):
+        """Log out and return to the login page via the root stack."""
+        if self._is_closing or self._is_logging_out:
+            return
+        self._is_logging_out = True
+        self._is_transitioning = True
+        ShadcnToast.suppress(True)
+        try:
+            self.api_client.suspend_health_checks()
+        except Exception:
+            pass
+        logger.info("Logging out user...")
+        try:
+            if self.auth_manager:
+                try:
+                    self.auth_manager.logout()
+                except Exception as e:
+                    logger.warning(f"AuthManager.logout failed (non-fatal): {e}")
+            if self.sync_manager:
+                try:
+                    self.sync_manager.sync_now()
+                except Exception:
+                    pass
+            self.current_user = None
+            self.permissions = []
+            self._ui_initialized = False
+            for page_name, page in list(self.pages.items()):
+                if hasattr(page, 'cleanup'):
+                    try:
+                        page.cleanup()
+                    except Exception:
+                        pass
+                page.setParent(None)
+                page.deleteLater()
+            self.pages.clear()
+            if self.stack:
+                self.stack.setParent(None)
+                self.stack.deleteLater()
+                self.stack = None
+            if self.main_central_widget is not None:
+                try:
+                    self.root_stack.removeWidget(self.main_central_widget)
+                except Exception:
+                    pass
+                self.main_central_widget.setParent(None)
+                self.main_central_widget.deleteLater()
+                self.main_central_widget = None
+            self.show_login_page(show_window=False)
+            try:
+                self.theme_manager.set_user(None)
+            except Exception as e:
+                logger.debug(f"Failed to clear appearance user context: {e}")
+        except Exception as e:
+            logger.error(f"Error during logout: {e}")
+        self._is_logging_out = False
+        QTimer.singleShot(0, self._end_transition)
+    def center_window(self):
+        screen = QApplication.primaryScreen()
+        if screen:
+            geometry = screen.availableGeometry()
+            self.move(geometry.center() - self.rect().center())
+    def closeEvent(self, event):
+        if self._is_closing:
+            event.accept()
+            return
+        self._is_closing = True
+        logger.info("Application closing...")
+        if self.sync_timer:
+            try:
+                self.sync_timer.stop()
+            except Exception:
+                pass
+            self.sync_timer = None
+        if self.sync_manager:
+            try:
+                self.sync_manager.stop()
+            except Exception:
+                pass
+            self.sync_manager = None
+        if self.api_client:
+            try:
+                self.api_client.shutdown()
+            except Exception:
+                pass
+            self.api_client = None
+        if self.db:
+            try:
+                self.db.close()
+            except Exception:
+                pass
+            self.db = None
+        self.pages.clear()
+        self.stack = None
+        self.main_central_widget = None
+        event.accept()
+    def showEvent(self, event):
+        """Handle show event."""
+        super().showEvent(event)
+        self._is_shown = True
+'''
+"""Main application window and orchestration layer for ICT Authority Access Control."""
+import logging
+from typing import Optional, Dict, List, Any
+from PySide6.QtWidgets import (
+    QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
+    QStackedWidget, QApplication, QMessageBox
+)
+from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, Signal, QRect
+from widgets.sidebar import Sidebar
+from widgets.header import Header
+from core.theme_manager import ThemeManager
+from pages.dashboard_page import DashboardPage
+from pages.visitors_page import VisitorsPage
+from pages.employees_page import EmployeesPage
+from pages.access_logs_page import AccessLogsPage
+from pages.field_config_page import FieldConfigPage
+from pages.report_page import ReportPage
+from pages.settings_page import SettingsPage
+from database.db_manager import DatabaseManager
+from config import Config
+from widgets.components import ShadcnToast
+from core.api_client import APIClient
+from core.auth_manager import AuthManager
+from core.data_service import DataService
+from core.sync_manager import SyncManager
+from core.env_manager import EnvironmentManager
+logger = logging.getLogger(__name__)
+class MainApp(QMainWindow):
+    """
+    Main application window managing the authenticated session.
+    """
+    logout_requested = Signal()
+    connection_changed = Signal(bool)
+    def __init__(self):
+        super().__init__()
+        self._is_closing = False
+        self._is_logging_out = False
+        self._ui_initialized = False
+        self.theme_manager = ThemeManager()
+        self.theme_manager.theme_changed.connect(self._on_theme_changed)
+        self.db = DatabaseManager()
+        self.env_manager = EnvironmentManager()
+        self.api_client = APIClient(self.env_manager.get_base_url())
+        self.env_manager.env_changed.connect(self._on_env_changed)
+        self.sync_manager: Optional[SyncManager] = None
+        self.data_service: Optional[DataService] = None
+        self.auth_manager: Optional[AuthManager] = None
+        self.current_user: Optional[Dict[str, Any]] = None
+        self.permissions: List[str] = []
+        self.main_central_widget: Optional[QWidget] = None
+        self.pages: Dict[str, QWidget] = {}
+        self.stack: Optional[QStackedWidget] = None
+        self.sidebar: Optional[Sidebar] = None
+        self.header: Optional[Header] = None
+        self.login_page: Optional[QWidget] = None
+        self.sync_timer: Optional[QTimer] = None
+        self._apply_window_sizing()
+        self.show_login_page()
+    def _apply_window_sizing(self):
+        """Apply window sizing based on configuration."""
+        self.setMinimumSize(Config.MIN_WIDTH, Config.MIN_HEIGHT)
+        if Config.START_MAXIMIZED:
+            self.setWindowState(Qt.WindowState.WindowMaximized)
+            logger.debug("Window starting maximized")
+        else:
+            geom = Config.get_window_geometry_for_startup()
+            if geom:
+                x, y, width, height = geom
+                self.setGeometry(x, y, width, height)
+                logger.debug(f"Window geometry set to: {width}x{height} at ({x}, {y})")
+            else:
+                self.resize(Config.INITIAL_WIDTH, Config.INITIAL_HEIGHT)
+                self.center_window()
+                logger.debug("Window using fallback geometry")
+    def _lazy_init_services(self):
+        """Initialize services only when needed (after login)."""
+        if self._is_closing:
+            return
+        if self.sync_manager is None:
+            logger.info("Initializing backend services...")
+            try:
+                self.sync_manager = SyncManager(self.api_client, self.db)
+                self.sync_manager.start()
+                self.data_service = DataService(self.api_client, self.db, self.sync_manager)
+                self.api_client.connection_changed.connect(self._on_connection_changed)
+                self._setup_auto_sync()
+                logger.info("Services initialized successfully")
+            except Exception as e:
+                logger.error(f"Failed to initialize services: {e}")
+                self._show_toast(
+                    "Service Initialization",
+                    "Some services failed to initialize. Some features may be limited.",
+                    "warning",
+                )
+    def _show_toast(self, title: str, message: str, variant: str = "default"):
+        """Show a toast notification."""
+        try:
+            ShadcnToast(title, message, variant=variant)
+        except Exception as e:
+            logger.error(f"Failed to show toast: {e}")
+    def _on_theme_changed(self, theme: str):
+        """
+        Handle the single application-wide theme event.
+        """
+        if self._is_closing:
+            return
+        logger.debug("Theme changed: %s", theme)
+        if self.header and hasattr(self.header, "on_theme_changed"):
+            self.header.on_theme_changed(theme)
+        if self.sidebar and hasattr(self.sidebar, "on_theme_changed"):
+            self.sidebar.on_theme_changed(theme)
+        if self.stack:
+            current_page = self.stack.currentWidget()
+            if current_page and hasattr(current_page, "on_theme_changed"):
+                try:
+                    current_page.on_theme_changed(theme)
+                except Exception as e:
+                    logger.debug(f"Error updating page theme: {e}")
+    def _on_env_changed(self, new_url: str):
+        """Handle environment URL change."""
+        if self._is_closing:
+            return
+        logger.info(f"Environment changed to: {new_url}")
+        self.api_client.base_url = new_url
+        self.api_client._check_online_status()
+        if self.current_user:
+            self._refresh_after_connection_change()
+    def _on_connection_changed(self, online: bool):
+        """Handle connection status changes."""
+        if self._is_closing:
+            return
+        if online and self.current_user:
+            if self.sync_manager:
+                self.sync_manager.sync()
+            self._refresh_after_connection_change()
+        elif not online:
+            logger.debug("App is offline")
+            self._show_toast(
+                "Offline Mode",
+                "You are offline. Changes will be synced when connection is restored.",
+                "warning",
+            )
+    def _refresh_after_connection_change(self):
+        """Refresh data after connection change."""
+        if self._is_closing:
+            return
+        if hasattr(self, 'stack') and self.stack:
+            current_widget = self.stack.currentWidget()
+            if hasattr(current_widget, 'refresh_data'):
+                try:
+                    current_widget.refresh_data()
+                except Exception as e:
+                    logger.error(f"Error refreshing data: {e}")
+    def _setup_auto_sync(self):
+        """Setup automatic sync timer with 2-minute interval."""
+        if self._is_closing:
+            return
+        self.sync_timer = QTimer(self)
+        self.sync_timer.timeout.connect(self._auto_sync_check)
+        self.sync_timer.start(120000)  # 2 minutes
+    def _auto_sync_check(self):
+        """Check connection and sync if online."""
+        if self._is_closing:
+            return
+        if self.api_client.is_online() and self.sync_manager:
+            self.sync_manager.sync()
+    def show_login_page(self):
+        """Show the login page with proper cleanup."""
+        if self._is_closing:
+            return
+        if self.login_page:
+            try:
+                self.login_page.deleteLater()
+            except Exception:
+                pass
+            self.login_page = None
+        from pages.login_page import LoginPage
+        if self.auth_manager is None:
+            self.auth_manager = AuthManager(self.api_client, self.db)
+        self.login_page = LoginPage(auth_manager=self.auth_manager)
+        self.login_page.login_successful.connect(self.on_login_success)
+        self.setCentralWidget(self.login_page)
+        self.setWindowTitle("Access Control - Login")
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.repaint()
+    def on_login_success(self, user_info: Dict[str, Any]):
+        """
+        Handle successful login - use permissions from JWT.
+        Args:
+            user_info: User information including permissions from JWT
+        """
+        if self._is_closing:
+            return
+        logger.info(f"Login successful for user: {user_info.get('username', 'unknown')}")
+        if self._ui_initialized and self.current_user:
+            logger.warning("UI already initialized, ignoring duplicate login signal")
+            return
+        if self.auth_manager:
+            self.permissions = list(self.auth_manager.permissions) if self.auth_manager.permissions else []
+            logger.debug(f"Permissions from auth_manager: {self.permissions}")
+        else:
+            self.permissions = ['view_dashboard']  # Fallback
+            logger.warning("Auth manager not available, using fallback permissions")
+        user_info.setdefault('id', user_info.get('username', 'User'))
+        user_info.setdefault('full_name', user_info.get('username', 'User'))
+        user_info.setdefault('email', '')
+        user_info.setdefault('permissions', self.permissions)
+        self.current_user = user_info
+        try:
+            user_id = (
+                user_info.get("id")
+                or user_info.get("_id")
+                or user_info.get("username")
+            )
+            self.theme_manager.set_user(str(user_id) if user_id else None)
+        except Exception as e:
+            logger.warning(f"Failed to apply per-user appearance: {e}")
+        self._lazy_init_services()
+        self.build_main_ui(user_info)
+        if self.login_page:
+            self.login_page.hide()
+            if hasattr(self.login_page, '_transitioning'):
+                self.login_page._transitioning = True
+        self.setCentralWidget(self.main_central_widget)
+        if Config.START_MAXIMIZED:
+            self.setWindowState(Qt.WindowState.WindowMaximized)
+        else:
+            geom = Config.get_window_geometry_for_startup()
+            if geom:
+                x, y, width, height = geom
+                self.setGeometry(x, y, width, height)
+            else:
+                self.center_window()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.setWindowOpacity(0.0)
+        self.fade_anim = QPropertyAnimation(self, b"windowOpacity")
+        self.fade_anim.setDuration(300)
+        self.fade_anim.setStartValue(0.0)
+        self.fade_anim.setEndValue(1.0)
+        self.fade_anim.setEasingCurve(QEasingCurve.Type.InCubic)
+        self.fade_anim.start()
+        QTimer.singleShot(400, self._cleanup_login_page)
+        self._ui_initialized = True
+        logger.info("Main UI displayed")
+    def _cleanup_login_page(self):
+        """Clean up the login page after transition."""
+        if self.login_page:
+            try:
+                self.login_page.deleteLater()
+            except Exception:
+                pass
+            self.login_page = None
+    def build_main_ui(self, user_info: Dict[str, Any]):
+        """
+        Build main UI with lazy page loading.
+        """
+        if self._is_closing:
+            return
+        if self._ui_initialized:
+            logger.debug("UI already built, skipping rebuild")
+            return
+        logger.debug("Building main UI...")
+        logger.debug("Permissions: %s", self.permissions)
+        self.setWindowTitle(f"Access Control System - {user_info['full_name']}")
+        central = QWidget()
+        central.setObjectName("mainCentralWidget")
+        main_layout = QHBoxLayout(central)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+        self.sidebar = Sidebar(self.permissions, user_info, self.theme_manager)
+        self.sidebar.navigation_requested.connect(self.navigate)
+        self.sidebar.toggled.connect(self._on_sidebar_toggled)
+        main_layout.addWidget(self.sidebar)
+        right_panel = QWidget()
+        right_panel.setObjectName("mainRightPanel")
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(0)
+        self.header = Header(user_info, self.theme_manager, sidebar_expanded=True)
+        self.header.menu_toggled.connect(self.sidebar.toggle_collapse)
+        self.header.logout_requested.connect(self.logout)
+        self.header.search_requested.connect(self.global_search)
+        right_layout.addWidget(self.header)
+        self.stack = QStackedWidget()
+        self.stack.setObjectName("mainStack")
+        self.pages = {}
+        self._load_pages()
+        right_layout.addWidget(self.stack)
+        main_layout.addWidget(right_panel, 1)
+        self.main_central_widget = central
+        logger.debug(f"Main UI built. Pages: {list(self.pages.keys())}")
+    def _load_pages(self):
+        """Load pages based on permissions."""
+        from pages.dashboard_page import DashboardPage
+        from pages.visitors_page import VisitorsPage
+        from pages.employees_page import EmployeesPage
+        from pages.access_logs_page import AccessLogsPage
+        from pages.field_config_page import FieldConfigPage
+        from pages.report_page import ReportPage
+        from pages.settings_page import SettingsPage
+        logger.debug(f"Loading pages with permissions: {self.permissions}")
+        if 'view_dashboard' in self.permissions or not self.permissions:
+            logger.debug("Loading Dashboard page")
+            page = DashboardPage(self.current_user, self.permissions, self.data_service)
+            if hasattr(page, 'navigate_requested'):
+                page.navigate_requested.connect(self.navigate)
+            self.pages['dashboard'] = page
+            self.stack.addWidget(page)
+        if self._has_permission(('manage_visitors', 'view_visitors')):
+            logger.debug("Loading Visitors page")
+            page = VisitorsPage(self.current_user, self.permissions, self.data_service)
+            if hasattr(page, 'navigate_requested'):
+                page.navigate_requested.connect(self.navigate)
+            self.pages['visitors'] = page
+            self.stack.addWidget(page)
+        if self._has_permission(('manage_employees', 'view_employees')):
+            logger.debug("Loading Employees page")
+            page = EmployeesPage(self.current_user, self.permissions, self.data_service)
+            if hasattr(page, 'navigate_requested'):
+                page.navigate_requested.connect(self.navigate)
+            self.pages['employees'] = page
+            self.stack.addWidget(page)
+        if 'view_access_logs' in self.permissions:
+            logger.debug("Loading Access Logs page")
+            page = AccessLogsPage(self.current_user, self.permissions, self.data_service)
+            self.pages['access_logs'] = page
+            self.stack.addWidget(page)
+        if 'configure_fields' in self.permissions:
+            logger.debug("Loading Field Config page")
+            page = FieldConfigPage(self.current_user, self.permissions, self.data_service)
+            self.pages['field_config'] = page
+            self.stack.addWidget(page)
+        if 'view_reports' in self.permissions:
+            logger.debug("Loading Reports page")
+            page = ReportPage(self.current_user, self.permissions, self.data_service)
+            self.pages['reports'] = page
+            self.stack.addWidget(page)
+        if 'manage_settings' in self.permissions:
+            logger.debug("Loading Settings page")
+            page = SettingsPage(
+                self.current_user,
+                self.permissions,
+                self.data_service,
+                env_manager=self.env_manager,
+                api_client=self.api_client,
+            )
+            self.pages['settings'] = page
+            self.stack.addWidget(page)
+        if 'manage_users' in self.permissions:
+            logger.debug("Loading User Management page")
+            from pages.user_management_page import UserManagementPage
+            page = UserManagementPage(self.current_user, self.permissions, self.data_service)
+            if hasattr(page, 'navigate_requested'):
+                page.navigate_requested.connect(self.navigate)
+            self.pages['users'] = page
+            self.stack.addWidget(page)
+        if self.stack.count() == 0:
+            logger.warning("No pages loaded - showing fallback")
+            from PySide6.QtWidgets import QLabel
+            fallback = QLabel("No permissions assigned.\nPlease contact your administrator.")
+            fallback.setAlignment(Qt.AlignCenter)
+            fallback.setStyleSheet("font-size:18px; color:#64748B; padding:40px;")
+            self.stack.addWidget(fallback)
+        if 'dashboard' in self.pages:
+            self.navigate('dashboard')
+        elif self.pages:
+            first_key = list(self.pages.keys())[0]
+            self.navigate(first_key)
+    def _has_permission(self, perm):
+        """Check if user has a specific permission."""
+        if isinstance(perm, tuple):
+            return any(p in self.permissions for p in perm)
+        return perm in self.permissions
+    def navigate(self, page_name: str):
+        """
+        Navigate to a specific page.
+        Args:
+            page_name: Name of the page to navigate to
+        """
+        if self._is_closing:
+            return
+        if page_name == 'logout':
+            self.logout()
+            return
+        if page_name in self.pages:
+            self.stack.setCurrentWidget(self.pages[page_name])
+            if self.sidebar:
+                self.sidebar.set_active(page_name)
+            if self.header:
+                self.header.set_title(page_name.replace('_', ' ').title())
+    def toggle_theme(self):
+        """Toggle between light and dark themes."""
+        if self._is_closing:
+            return
+        self.theme_manager.toggle_theme()
+    def _on_sidebar_toggled(self, expanded: bool):
+        """Handle sidebar toggle."""
+        if self._is_closing:
+            return
+        if self.header:
+            self.header.set_sidebar_expanded(expanded)
+    def global_search(self, text: str):
+        """Handle global search."""
+        if self._is_closing:
+            return
+        if self.stack and self.stack.currentWidget():
+            if hasattr(self.stack.currentWidget(), 'filter_table'):
+                self.stack.currentWidget().filter_table(text)
+    def logout(self):
+        """Log out the current user and return to login page."""
+        if self._is_closing or self._is_logging_out:
+            return
+        self._is_logging_out = True
+        logger.info("Logging out user...")
+        try:
+            self.theme_manager.set_user(None)
+        except Exception as e:
+            logger.debug(f"Failed to clear appearance user context: {e}")
+        try:
+            if self.auth_manager:
+                try:
+                    self.auth_manager.logout()
+                except Exception as e:
+                    logger.warning(f"AuthManager.logout failed (non-fatal): {e}")
+            if self.sync_manager:
+                try:
+                    self.sync_manager.sync_now()
+                except Exception:
+                    pass
+            self.current_user = None
+            self.permissions = []
+            self._ui_initialized = False
+            for page_name, page in list(self.pages.items()):
+                if hasattr(page, 'cleanup'):
+                    try:
+                        page.cleanup()
+                    except Exception:
+                        pass
+                page.deleteLater()
+            self.pages.clear()
+            if self.stack:
+                self.stack.deleteLater()
+                self.stack = None
+            if self.main_central_widget:
+                self.main_central_widget.deleteLater()
+                self.main_central_widget = None
+            self.show_login_page()
+        except Exception as e:
+            logger.error(f"Error during logout: {e}")
+        self._is_logging_out = False
+    def center_window(self):
+        """Center the window on the primary screen."""
+        screen = QApplication.primaryScreen()
+        if screen:
+            geometry = screen.availableGeometry()
+            self.move(geometry.center() - self.rect().center())
+    def closeEvent(self, event):
+        """Handle application close event with proper cleanup."""
+        if self._is_closing:
+            event.accept()
+            return
+        self._is_closing = True
+        logger.info("Application closing...")
+        if self.sync_timer:
+            try:
+                self.sync_timer.stop()
+            except Exception:
+                pass
+            self.sync_timer = None
+        if self.sync_manager:
+            try:
+                self.sync_manager.stop()
+            except Exception:
+                pass
+            self.sync_manager = None
+        if self.api_client:
+            try:
+                self.api_client.shutdown()
+            except Exception:
+                pass
+            self.api_client = None
+        if self.db:
+            try:
+                self.db.close()
+            except Exception:
+                pass
+            self.db = None
+        self.pages.clear()
+        self.stack = None
+        self.main_central_widget = None
+        event.accept()
+    def showEvent(self, event):
+        """Handle show event."""
+        super().showEvent(event)
+        if not self._is_closing and not self._ui_initialized:
+            QTimer.singleShot(50, lambda: self._on_theme_changed(self.theme_manager.get_current_theme()))
+'''
+'''
+"""Main application window and orchestration layer for ICT Authority Access Control."""
+import logging
+from typing import Optional, Dict, List, Any
+from PySide6.QtWidgets import (
+    QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, 
+    QStackedWidget, QApplication, QMessageBox
+)
+from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, Signal, QRect
+from widgets.sidebar import Sidebar
+from widgets.header import Header
+from core.theme_manager import ThemeManager
+from pages.dashboard_page import DashboardPage
+from pages.visitors_page import VisitorsPage
+from pages.employees_page import EmployeesPage
+from pages.access_logs_page import AccessLogsPage
+from pages.field_config_page import FieldConfigPage
+from pages.report_page import ReportPage
+from pages.settings_page import SettingsPage
+from database.db_manager import DatabaseManager
+from config import Config
+from widgets.components import ShadcnToast
+from core.api_client import APIClient
+from core.auth_manager import AuthManager
+from core.data_service import DataService
+from core.sync_manager import SyncManager
+from core.env_manager import EnvironmentManager
+logger = logging.getLogger(__name__)
+class MainApp(QMainWindow):
+    """
+    Main application window managing the authenticated session.
+    """
+    logout_requested = Signal()
+    connection_changed = Signal(bool)
+    def __init__(self):
+        super().__init__()
+        self._is_closing = False
+        self._is_logging_out = False
+        self._ui_initialized = False
+        self.theme_manager = ThemeManager()
+        self.theme_manager.theme_changed.connect(self._on_theme_changed)
+        self.db = DatabaseManager()
+        self.env_manager = EnvironmentManager()
+        self.api_client = APIClient(self.env_manager.get_base_url())
+        self.env_manager.env_changed.connect(self._on_env_changed)
+        self.sync_manager: Optional[SyncManager] = None
+        self.data_service: Optional[DataService] = None
+        self.auth_manager: Optional[AuthManager] = None
+        self.current_user: Optional[Dict[str, Any]] = None
+        self.permissions: List[str] = []
+        self.main_central_widget: Optional[QWidget] = None
+        self.pages: Dict[str, QWidget] = {}
+        self.stack: Optional[QStackedWidget] = None
+        self.sidebar: Optional[Sidebar] = None
+        self.header: Optional[Header] = None
+        self.login_page: Optional[QWidget] = None
+        self.sync_timer: Optional[QTimer] = None
+        self._apply_window_sizing()
+        self.show_login_page()
+    def _apply_window_sizing(self):
+        """Apply window sizing based on configuration."""
+        self.setMinimumSize(Config.MIN_WIDTH, Config.MIN_HEIGHT)
+        if Config.START_MAXIMIZED:
+            self.setWindowState(Qt.WindowState.WindowMaximized)
+            logger.debug("Window starting maximized")
+        else:
+            geom = Config.get_window_geometry_for_startup()
+            if geom:
+                x, y, width, height = geom
+                self.setGeometry(x, y, width, height)
+                logger.debug(f"Window geometry set to: {width}x{height} at ({x}, {y})")
+            else:
+                self.resize(Config.INITIAL_WIDTH, Config.INITIAL_HEIGHT)
+                self.center_window()
+                logger.debug("Window using fallback geometry")
+    def _lazy_init_services(self):
+        """Initialize services only when needed (after login)."""
+        if self._is_closing:
+            return
+        if self.sync_manager is None:
+            logger.info("Initializing backend services...")
+            try:
+                self.sync_manager = SyncManager(self.api_client, self.db)
+                self.sync_manager.start()
+                self.data_service = DataService(self.api_client, self.db, self.sync_manager)
+                self.api_client.connection_changed.connect(self._on_connection_changed)
+                self._setup_auto_sync()
+                logger.info("Services initialized successfully")
+            except Exception as e:
+                logger.error(f"Failed to initialize services: {e}")
+                self._show_toast("Service Initialization", 
+                                "Some services failed to initialize. Some features may be limited.",
+                                "warning")
+    def _show_toast(self, title: str, message: str, variant: str = "default"):
+        """Show a toast notification."""
+        try:
+            ShadcnToast(title, message, variant=variant)
+        except Exception as e:
+            logger.error(f"Failed to show toast: {e}")
+    def _on_theme_changed(self, theme: str):
+        """
+        Handle the single application-wide theme event.
+        """
+        if self._is_closing:
+            return
+        logger.debug("Theme changed: %s", theme)
+        if self.header and hasattr(self.header, "on_theme_changed"):
+            self.header.on_theme_changed(theme)
+        if self.sidebar and hasattr(self.sidebar, "on_theme_changed"):
+            self.sidebar.on_theme_changed(theme)
+        if self.stack:
+            current_page = self.stack.currentWidget()
+            if current_page and hasattr(current_page, "on_theme_changed"):
+                try:
+                    current_page.on_theme_changed(theme)
+                except Exception as e:
+                    logger.debug(f"Error updating page theme: {e}")
+    def _on_env_changed(self, new_url: str):
+        """Handle environment URL change."""
+        if self._is_closing:
+            return
+        logger.info(f"Environment changed to: {new_url}")
+        self.api_client.base_url = new_url
+        self.api_client._check_online_status()
+        if self.current_user:
+            self._refresh_after_connection_change()
+    def _on_connection_changed(self, online: bool):
+        """Handle connection status changes."""
+        if self._is_closing:
+            return
+        if online and self.current_user:
+            if self.sync_manager:
+                self.sync_manager.sync()
+            self._refresh_after_connection_change()
+        elif not online:
+            logger.debug("App is offline")
+            self._show_toast("Offline Mode", 
+                            "You are offline. Changes will be synced when connection is restored.",
+                            "warning")
+    def _refresh_after_connection_change(self):
+        """Refresh data after connection change."""
+        if self._is_closing:
+            return
+        if hasattr(self, 'stack') and self.stack:
+            current_widget = self.stack.currentWidget()
+            if hasattr(current_widget, 'refresh_data'):
+                try:
+                    current_widget.refresh_data()
+                except Exception as e:
+                    logger.error(f"Error refreshing data: {e}")
+    def _setup_auto_sync(self):
+        """Setup automatic sync timer with 2-minute interval."""
+        if self._is_closing:
+            return
+        self.sync_timer = QTimer(self)
+        self.sync_timer.timeout.connect(self._auto_sync_check)
+        self.sync_timer.start(120000)  # 2 minutes
+    def _auto_sync_check(self):
+        """Check connection and sync if online."""
+        if self._is_closing:
+            return
+        if self.api_client.is_online() and self.sync_manager:
+            self.sync_manager.sync()
+    def show_login_page(self):
+        """Show the login page with proper cleanup."""
+        if self._is_closing:
+            return
+        if self.login_page:
+            try:
+                self.login_page.deleteLater()
+            except Exception:
+                pass
+            self.login_page = None
+        from pages.login_page import LoginPage
+        if self.auth_manager is None:
+            self.auth_manager = AuthManager(self.api_client, self.db)
+        self.login_page = LoginPage(auth_manager=self.auth_manager)
+        self.login_page.login_successful.connect(self.on_login_success)
+        self.setCentralWidget(self.login_page)
+        self.setWindowTitle("Access Control - Login")
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.repaint()
+    def on_login_success(self, user_info: Dict[str, Any]):
+        """
+        Handle successful login - use permissions from JWT.
+        Args:
+            user_info: User information including permissions from JWT
+        """
+        if self._is_closing:
+            return
+        logger.info(f"Login successful for user: {user_info.get('username', 'unknown')}")
+        if self._ui_initialized and self.current_user:
+            logger.warning("UI already initialized, ignoring duplicate login signal")
+            return
+        if self.auth_manager:
+            self.permissions = list(self.auth_manager.permissions) if self.auth_manager.permissions else []
+            logger.debug(f"Permissions from auth_manager: {self.permissions}")
+        else:
+            self.permissions = ['view_dashboard']  # Fallback
+            logger.warning("Auth manager not available, using fallback permissions")
+        user_info.setdefault('id', user_info.get('username', 'User'))
+        user_info.setdefault('full_name', user_info.get('username', 'User'))
+        user_info.setdefault('email', '')
+        user_info.setdefault('permissions', self.permissions)
+        self.current_user = user_info
+        self._lazy_init_services()
+        self.build_main_ui(user_info)
+        if self.login_page:
+            self.login_page.hide()
+            if hasattr(self.login_page, '_transitioning'):
+                self.login_page._transitioning = True
+        self.setCentralWidget(self.main_central_widget)
+        if Config.START_MAXIMIZED:
+            self.setWindowState(Qt.WindowState.WindowMaximized)
+        else:
+            geom = Config.get_window_geometry_for_startup()
+            if geom:
+                x, y, width, height = geom
+                self.setGeometry(x, y, width, height)
+            else:
+                self.center_window()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.setWindowOpacity(0.0)
+        self.fade_anim = QPropertyAnimation(self, b"windowOpacity")
+        self.fade_anim.setDuration(300)
+        self.fade_anim.setStartValue(0.0)
+        self.fade_anim.setEndValue(1.0)
+        self.fade_anim.setEasingCurve(QEasingCurve.Type.InCubic)
+        self.fade_anim.start()
+        QTimer.singleShot(400, self._cleanup_login_page)
+        self._ui_initialized = True
+        logger.info("Main UI displayed")
+    def _cleanup_login_page(self):
+        """Clean up the login page after transition."""
+        if self.login_page:
+            try:
+                self.login_page.deleteLater()
+            except Exception:
+                pass
+            self.login_page = None
+    def build_main_ui(self, user_info: Dict[str, Any]):
+        """
+        Build main UI with lazy page loading.
+        """
+        if self._is_closing:
+            return
+        if self._ui_initialized:
+            logger.debug("UI already built, skipping rebuild")
+            return
+        logger.debug("Building main UI...")
+        logger.debug("Permissions: %s", self.permissions)
+        self.setWindowTitle(f"Access Control System - {user_info['full_name']}")
+        central = QWidget()
+        central.setObjectName("mainCentralWidget")
+        main_layout = QHBoxLayout(central)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+        self.sidebar = Sidebar(self.permissions, user_info, self.theme_manager)
+        self.sidebar.navigation_requested.connect(self.navigate)
+        self.sidebar.toggled.connect(self._on_sidebar_toggled)
+        main_layout.addWidget(self.sidebar)
+        right_panel = QWidget()
+        right_panel.setObjectName("mainRightPanel")
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(0)
+        self.header = Header(user_info, self.theme_manager, sidebar_expanded=True)
+        self.header.menu_toggled.connect(self.sidebar.toggle_collapse)
+        self.header.logout_requested.connect(self.logout)
+        self.header.search_requested.connect(self.global_search)
+        right_layout.addWidget(self.header)
+        self.stack = QStackedWidget()
+        self.stack.setObjectName("mainStack")
+        self.pages = {}
+        self._load_pages()
+        right_layout.addWidget(self.stack)
+        main_layout.addWidget(right_panel, 1)
+        self.main_central_widget = central
+        logger.debug(f"Main UI built. Pages: {list(self.pages.keys())}")
+    def _load_pages(self):
+        """Load pages based on permissions."""
+        from pages.dashboard_page import DashboardPage
+        from pages.visitors_page import VisitorsPage
+        from pages.employees_page import EmployeesPage
+        from pages.access_logs_page import AccessLogsPage
+        from pages.field_config_page import FieldConfigPage
+        from pages.report_page import ReportPage
+        from pages.settings_page import SettingsPage
+        logger.debug(f"Loading pages with permissions: {self.permissions}")
+        if 'view_dashboard' in self.permissions or not self.permissions:
+            logger.debug("Loading Dashboard page")
+            page = DashboardPage(self.current_user, self.permissions, self.data_service)
+            if hasattr(page, 'navigate_requested'):
+                page.navigate_requested.connect(self.navigate)
+            self.pages['dashboard'] = page
+            self.stack.addWidget(page)
+        if self._has_permission(('manage_visitors', 'view_visitors')):
+            logger.debug("Loading Visitors page")
+            page = VisitorsPage(self.current_user, self.permissions, self.data_service)
+            if hasattr(page, 'navigate_requested'):
+                page.navigate_requested.connect(self.navigate)
+            self.pages['visitors'] = page
+            self.stack.addWidget(page)
+        if self._has_permission(('manage_employees', 'view_employees')):
+            logger.debug("Loading Employees page")
+            page = EmployeesPage(self.current_user, self.permissions, self.data_service)
+            if hasattr(page, 'navigate_requested'):
+                page.navigate_requested.connect(self.navigate)
+            self.pages['employees'] = page
+            self.stack.addWidget(page)
+        if 'view_access_logs' in self.permissions:
+            logger.debug("Loading Access Logs page")
+            page = AccessLogsPage(self.current_user, self.permissions, self.data_service)
+            self.pages['access_logs'] = page
+            self.stack.addWidget(page)
+        if 'configure_fields' in self.permissions:
+            logger.debug("Loading Field Config page")
+            page = FieldConfigPage(self.current_user, self.permissions, self.data_service)
+            self.pages['field_config'] = page
+            self.stack.addWidget(page)
+        if 'view_reports' in self.permissions:
+            logger.debug("Loading Reports page")
+            page = ReportPage(self.current_user, self.permissions, self.data_service)
+            self.pages['reports'] = page
+            self.stack.addWidget(page)
+        if 'manage_settings' in self.permissions:
+            logger.debug("Loading Settings page")
+            page = SettingsPage(
+                self.current_user, 
+                self.permissions, 
+                self.data_service,
+                env_manager=self.env_manager,
+                api_client=self.api_client
+            )
+            self.pages['settings'] = page
+            self.stack.addWidget(page)
+        if 'manage_users' in self.permissions:
+            logger.debug("Loading User Management page")
+            from pages.user_management_page import UserManagementPage
+            page = UserManagementPage(self.current_user, self.permissions, self.data_service)
+            if hasattr(page, 'navigate_requested'):
+                page.navigate_requested.connect(self.navigate)
+            self.pages['users'] = page
+            self.stack.addWidget(page)
+        if self.stack.count() == 0:
+            logger.warning("No pages loaded - showing fallback")
+            from PySide6.QtWidgets import QLabel
+            fallback = QLabel("No permissions assigned.\nPlease contact your administrator.")
+            fallback.setAlignment(Qt.AlignCenter)
+            fallback.setStyleSheet("font-size:18px; color:#64748B; padding:40px;")
+            self.stack.addWidget(fallback)
+        if 'dashboard' in self.pages:
+            self.navigate('dashboard')
+        elif self.pages:
+            first_key = list(self.pages.keys())[0]
+            self.navigate(first_key)
+    def _has_permission(self, perm):
+        """Check if user has a specific permission."""
+        if isinstance(perm, tuple):
+            return any(p in self.permissions for p in perm)
+        return perm in self.permissions
+    def navigate(self, page_name: str):
+        """
+        Navigate to a specific page.
+        Args:
+            page_name: Name of the page to navigate to
+        """
+        if self._is_closing:
+            return
+        if page_name == 'logout':
+            self.logout()
+            return
+        if page_name in self.pages:
+            self.stack.setCurrentWidget(self.pages[page_name])
+            if self.sidebar:
+                self.sidebar.set_active(page_name)
+            if self.header:
+                self.header.set_title(page_name.replace('_', ' ').title())
+    def toggle_theme(self):
+        """Toggle between light and dark themes."""
+        if self._is_closing:
+            return
+        self.theme_manager.toggle_theme()
+    def _on_sidebar_toggled(self, expanded: bool):
+        """Handle sidebar toggle."""
+        if self._is_closing:
+            return
+        if self.header:
+            self.header.set_sidebar_expanded(expanded)
+    def global_search(self, text: str):
+        """Handle global search."""
+        if self._is_closing:
+            return
+        if self.stack and self.stack.currentWidget():
+            if hasattr(self.stack.currentWidget(), 'filter_table'):
+                self.stack.currentWidget().filter_table(text)
+    def logout(self):
+        """Log out the current user and return to login page."""
+        if self._is_closing or self._is_logging_out:
+            return
+        self._is_logging_out = True
+        logger.info("Logging out user...")
+        try:
+            if self.sync_manager:
+                try:
+                    self.sync_manager.sync_now()
+                except Exception:
+                    pass
+            self.current_user = None
+            self.permissions = []
+            self._ui_initialized = False
+            for page_name, page in list(self.pages.items()):
+                if hasattr(page, 'cleanup'):
+                    try:
+                        page.cleanup()
+                    except Exception:
+                        pass
+                page.deleteLater()
+            self.pages.clear()
+            if self.stack:
+                self.stack.deleteLater()
+                self.stack = None
+            if self.main_central_widget:
+                self.main_central_widget.deleteLater()
+                self.main_central_widget = None
+            self.show_login_page()
+        except Exception as e:
+            logger.error(f"Error during logout: {e}")
+        self._is_logging_out = False
+    def center_window(self):
+        """Center the window on the primary screen."""
+        screen = QApplication.primaryScreen()
+        if screen:
+            geometry = screen.availableGeometry()
+            self.move(geometry.center() - self.rect().center())
+    def closeEvent(self, event):
+        """Handle application close event with proper cleanup."""
+        if self._is_closing:
+            event.accept()
+            return
+        self._is_closing = True
+        logger.info("Application closing...")
+        if self.sync_timer:
+            try:
+                self.sync_timer.stop()
+            except Exception:
+                pass
+            self.sync_timer = None
+        if self.sync_manager:
+            try:
+                self.sync_manager.stop()
+            except Exception:
+                pass
+            self.sync_manager = None
+        if self.api_client:
+            try:
+                self.api_client.shutdown()
+            except Exception:
+                pass
+            self.api_client = None
+        if self.db:
+            try:
+                self.db.close()
+            except Exception:
+                pass
+            self.db = None
+        self.pages.clear()
+        self.stack = None
+        self.main_central_widget = None
+        event.accept()
+    def showEvent(self, event):
+        """Handle show event."""
+        super().showEvent(event)
+        if not self._is_closing and not self._ui_initialized:
+            QTimer.singleShot(50, lambda: self._on_theme_changed(self.theme_manager.get_current_theme()))'''
+'''
+"""Main application window and orchestration layer for ICT Authority Access Control."""
+import logging
+from typing import Optional, Dict, List, Any
+from PySide6.QtWidgets import (
+    QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, 
+    QStackedWidget, QApplication, QMessageBox
+)
+from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, Signal, QRect
+from widgets.sidebar import Sidebar
+from widgets.header import Header
+from core.theme_manager import ThemeManager
+from pages.dashboard_page import DashboardPage
+from pages.visitors_page import VisitorsPage
+from pages.employees_page import EmployeesPage
+from pages.access_logs_page import AccessLogsPage
+from pages.field_config_page import FieldConfigPage
+from pages.report_page import ReportPage
+from pages.settings_page import SettingsPage
+from database.db_manager import DatabaseManager
+from config import Config
+from widgets.components import ShadcnToast
+from core.api_client import APIClient
+from core.auth_manager import AuthManager
+from core.data_service import DataService
+from core.sync_manager import SyncManager
+from core.env_manager import EnvironmentManager
+logger = logging.getLogger(__name__)
+class MainApp(QMainWindow):
+    """
+    Main application window managing the authenticated session.
+    """
+    logout_requested = Signal()
+    connection_changed = Signal(bool)
+    def __init__(self):
+        super().__init__()
+        self._is_closing = False
+        self.theme_manager = ThemeManager()
+        self.theme_manager.theme_changed.connect(self._on_theme_changed)
+        self.db = DatabaseManager()
+        self.env_manager = EnvironmentManager()
+        self.api_client = APIClient(self.env_manager.get_base_url())
+        self.env_manager.env_changed.connect(self._on_env_changed)
+        self.sync_manager: Optional[SyncManager] = None
+        self.data_service: Optional[DataService] = None
+        self.auth_manager: Optional[AuthManager] = None
+        self.current_user: Optional[Dict[str, Any]] = None
+        self.permissions: List[str] = []
+        self.main_central_widget: Optional[QWidget] = None
+        self.pages: Dict[str, QWidget] = {}
+        self.stack: Optional[QStackedWidget] = None
+        self.sidebar: Optional[Sidebar] = None
+        self.header: Optional[Header] = None
+        self.login_page: Optional[QWidget] = None
+        self.sync_timer: Optional[QTimer] = None
+        self._is_logging_out = False
+        self._apply_window_sizing()
+        self.show_login_page()
+    def _apply_window_sizing(self):
+        """Apply window sizing based on configuration."""
+        self.setMinimumSize(Config.MIN_WIDTH, Config.MIN_HEIGHT)
+        if Config.START_MAXIMIZED:
+            self.setWindowState(Qt.WindowState.WindowMaximized)
+            logger.debug("Window starting maximized")
+        else:
+            geom = Config.get_window_geometry_for_startup()
+            if geom:
+                x, y, width, height = geom
+                self.setGeometry(x, y, width, height)
+                logger.debug(f"Window geometry set to: {width}x{height} at ({x}, {y})")
+            else:
+                self.resize(Config.INITIAL_WIDTH, Config.INITIAL_HEIGHT)
+                self.center_window()
+                logger.debug("Window using fallback geometry")
+    def _lazy_init_services(self):
+        """Initialize services only when needed (after login)."""
+        if self._is_closing:
+            return
+        if self.sync_manager is None:
+            logger.info("Initializing backend services...")
+            try:
+                self.sync_manager = SyncManager(self.api_client, self.db)
+                self.sync_manager.start()
+                self.data_service = DataService(self.api_client, self.db, self.sync_manager)
+                self.api_client.connection_changed.connect(self._on_connection_changed)
+                self._setup_auto_sync()
+                logger.info("Services initialized successfully")
+            except Exception as e:
+                logger.error(f"Failed to initialize services: {e}")
+                self._show_toast("Service Initialization", 
+                                "Some services failed to initialize. Some features may be limited.",
+                                "warning")
+    def _show_toast(self, title: str, message: str, variant: str = "default"):
+        """Show a toast notification."""
+        try:
+            ShadcnToast(title, message, variant=variant)
+        except Exception as e:
+            logger.error(f"Failed to show toast: {e}")
+    def _on_theme_changed(self, theme: str):
+        """
+        Handle the single application-wide theme event.
+        ThemeManager has already:
+            - changed the theme
+            - updated tokens
+            - persisted the preference
+            - applied QApplication stylesheet
+        MainApp only handles components that have genuinely
+        theme-dependent resources outside QSS.
+        """
+        if self._is_closing:
+            return
+        logger.debug("Theme changed: %s", theme)
+        if self.header and hasattr(self.header, "on_theme_changed"):
+            self.header.on_theme_changed(theme)
+        if self.sidebar and hasattr(self.sidebar, "on_theme_changed"):
+            self.sidebar.on_theme_changed(theme)
+        if self.stack:
+            current_page = self.stack.currentWidget()
+            if current_page and hasattr(current_page, "on_theme_changed"):
+                try:
+                    current_page.on_theme_changed(theme)
+                except Exception as e:
+                    logger.debug(f"Error updating page theme: {e}")
+    def _on_env_changed(self, new_url: str):
+        """Handle environment URL change."""
+        if self._is_closing:
+            return
+        logger.info(f"Environment changed to: {new_url}")
+        self.api_client.base_url = new_url
+        self.api_client._check_online_status()
+        if self.current_user:
+            self._refresh_after_connection_change()
+    def _on_connection_changed(self, online: bool):
+        """Handle connection status changes."""
+        if self._is_closing:
+            return
+        if online and self.current_user:
+            if self.sync_manager:
+                self.sync_manager.sync()
+            self._refresh_after_connection_change()
+        elif not online:
+            logger.debug("App is offline")
+            self._show_toast("Offline Mode", 
+                            "You are offline. Changes will be synced when connection is restored.",
+                            "warning")
+    def _refresh_after_connection_change(self):
+        """Refresh data after connection change."""
+        if self._is_closing:
+            return
+        if hasattr(self, 'stack') and self.stack:
+            current_widget = self.stack.currentWidget()
+            if hasattr(current_widget, 'refresh_data'):
+                try:
+                    current_widget.refresh_data()
+                except Exception as e:
+                    logger.error(f"Error refreshing data: {e}")
+    def _setup_auto_sync(self):
+        """Setup automatic sync timer with 2-minute interval."""
+        if self._is_closing:
+            return
+        self.sync_timer = QTimer(self)
+        self.sync_timer.timeout.connect(self._auto_sync_check)
+        self.sync_timer.start(120000)  # 2 minutes
+    def _auto_sync_check(self):
+        """Check connection and sync if online."""
+        if self._is_closing:
+            return
+        if self.api_client.is_online() and self.sync_manager:
+            self.sync_manager.sync()
+    def show_login_page(self):
+        """Show the login page with proper cleanup."""
+        if self._is_closing:
+            return
+        if self.login_page:
+            try:
+                self.login_page.deleteLater()
+            except Exception:
+                pass
+            self.login_page = None
+        from pages.login_page import LoginPage
+        if self.auth_manager is None:
+            self.auth_manager = AuthManager(self.api_client, self.db)
+        self.login_page = LoginPage(auth_manager=self.auth_manager)
+        self.login_page.login_successful.connect(self.on_login_success)
+        self.setCentralWidget(self.login_page)
+        self.setWindowTitle("Access Control - Login")
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.repaint()
+    def on_login_success(self, user_info: Dict[str, Any]):
+        """
+        Handle successful login - use permissions from JWT.
+        Args:
+            user_info: User information including permissions from JWT
+        """
+        if self._is_closing:
+            return
+        logger.info(f"Login successful for user: {user_info.get('username', 'unknown')}")
+        if self.auth_manager:
+            self.permissions = list(self.auth_manager.permissions) if self.auth_manager.permissions else []
+            logger.debug(f"Permissions from auth_manager: {self.permissions}")
+        else:
+            self.permissions = ['view_dashboard']  # Fallback
+            logger.warning("Auth manager not available, using fallback permissions")
+        user_info.setdefault('id', user_info.get('username', 'User'))
+        user_info.setdefault('full_name', user_info.get('username', 'User'))
+        user_info.setdefault('email', '')
+        user_info.setdefault('permissions', self.permissions)
+        self.current_user = user_info
+        self._lazy_init_services()
+        self.build_main_ui(user_info)
+        if self.login_page:
+            self.login_page.hide()
+        self.setCentralWidget(self.main_central_widget)
+        if Config.START_MAXIMIZED:
+            self.setWindowState(Qt.WindowState.WindowMaximized)
+        else:
+            geom = Config.get_window_geometry_for_startup()
+            if geom:
+                x, y, width, height = geom
+                self.setGeometry(x, y, width, height)
+            else:
+                self.center_window()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.setWindowOpacity(0.0)
+        self.fade_anim = QPropertyAnimation(self, b"windowOpacity")
+        self.fade_anim.setDuration(400)
+        self.fade_anim.setStartValue(0.0)
+        self.fade_anim.setEndValue(1.0)
+        self.fade_anim.setEasingCurve(QEasingCurve.Type.InCubic)
+        self.fade_anim.start()
+        QTimer.singleShot(500, lambda: self.setWindowOpacity(1.0))
+        if self.login_page:
+            QTimer.singleShot(600, self.login_page.deleteLater)
+        logger.info("Main UI displayed")
+    def build_main_ui(self, user_info: Dict[str, Any]):
+        """
+        Build main UI with lazy page loading.
+        Theme styling is owned by ThemeManager/QApplication.
+        """
+        if self._is_closing:
+            return
+        logger.debug("Building main UI...")
+        logger.debug("Permissions: %s", self.permissions)
+        self.setWindowTitle(f"Access Control System - {user_info['full_name']}")
+        central = QWidget()
+        central.setObjectName("mainCentralWidget")
+        main_layout = QHBoxLayout(central)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+        self.sidebar = Sidebar(self.permissions, user_info, self.theme_manager)
+        self.sidebar.navigation_requested.connect(self.navigate)
+        self.sidebar.toggled.connect(self._on_sidebar_toggled)
+        main_layout.addWidget(self.sidebar)
+        right_panel = QWidget()
+        right_panel.setObjectName("mainRightPanel")
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(0)
+        self.header = Header(user_info, self.theme_manager, sidebar_expanded=True)
+        self.header.menu_toggled.connect(self.sidebar.toggle_collapse)
+        self.header.logout_requested.connect(self.logout)
+        self.header.search_requested.connect(self.global_search)
+        right_layout.addWidget(self.header)
+        self.stack = QStackedWidget()
+        self.stack.setObjectName("mainStack")
+        self.pages = {}
+        self._load_pages()
+        right_layout.addWidget(self.stack)
+        main_layout.addWidget(right_panel, 1)
+        self.main_central_widget = central
+        logger.debug(f"Main UI built. Pages: {list(self.pages.keys())}")
+    def _load_pages(self):
+        """Load pages based on permissions."""
+        from pages.dashboard_page import DashboardPage
+        from pages.visitors_page import VisitorsPage
+        from pages.employees_page import EmployeesPage
+        from pages.access_logs_page import AccessLogsPage
+        from pages.field_config_page import FieldConfigPage
+        from pages.report_page import ReportPage
+        from pages.settings_page import SettingsPage
+        logger.debug(f"Loading pages with permissions: {self.permissions}")
+        if 'view_dashboard' in self.permissions or not self.permissions:
+            logger.debug("Loading Dashboard page")
+            page = DashboardPage(self.current_user, self.permissions, self.data_service)
+            if hasattr(page, 'navigate_requested'):
+                page.navigate_requested.connect(self.navigate)
+            self.pages['dashboard'] = page
+            self.stack.addWidget(page)
+        if self._has_permission(('manage_visitors', 'view_visitors')):
+            logger.debug("Loading Visitors page")
+            page = VisitorsPage(self.current_user, self.permissions, self.data_service)
+            if hasattr(page, 'navigate_requested'):
+                page.navigate_requested.connect(self.navigate)
+            self.pages['visitors'] = page
+            self.stack.addWidget(page)
+        if self._has_permission(('manage_employees', 'view_employees')):
+            logger.debug("Loading Employees page")
+            page = EmployeesPage(self.current_user, self.permissions, self.data_service)
+            if hasattr(page, 'navigate_requested'):
+                page.navigate_requested.connect(self.navigate)
+            self.pages['employees'] = page
+            self.stack.addWidget(page)
+        if 'view_access_logs' in self.permissions:
+            logger.debug("Loading Access Logs page")
+            page = AccessLogsPage(self.current_user, self.permissions, self.data_service)
+            self.pages['access_logs'] = page
+            self.stack.addWidget(page)
+        if 'configure_fields' in self.permissions:
+            logger.debug("Loading Field Config page")
+            page = FieldConfigPage(self.current_user, self.permissions, self.data_service)
+            self.pages['field_config'] = page
+            self.stack.addWidget(page)
+        if 'view_reports' in self.permissions:
+            logger.debug("Loading Reports page")
+            page = ReportPage(self.current_user, self.permissions, self.data_service)
+            self.pages['reports'] = page
+            self.stack.addWidget(page)
+        if 'manage_settings' in self.permissions:
+            logger.debug("Loading Settings page")
+            page = SettingsPage(
+                self.current_user, 
+                self.permissions, 
+                self.data_service,
+                env_manager=self.env_manager,
+                api_client=self.api_client
+            )
+            self.pages['settings'] = page
+            self.stack.addWidget(page)
+        if 'manage_users' in self.permissions:
+            logger.debug("Loading User Management page")
+            from pages.user_management_page import UserManagementPage
+            page = UserManagementPage(self.current_user, self.permissions, self.data_service)
+            if hasattr(page, 'navigate_requested'):
+                page.navigate_requested.connect(self.navigate)
+            self.pages['users'] = page
+            self.stack.addWidget(page)
+        if self.stack.count() == 0:
+            logger.warning("No pages loaded - showing fallback")
+            from PySide6.QtWidgets import QLabel
+            fallback = QLabel("No permissions assigned.\nPlease contact your administrator.")
+            fallback.setAlignment(Qt.AlignCenter)
+            fallback.setStyleSheet("font-size:18px; color:#64748B; padding:40px;")
+            self.stack.addWidget(fallback)
+        if 'dashboard' in self.pages:
+            self.navigate('dashboard')
+        elif self.pages:
+            first_key = list(self.pages.keys())[0]
+            self.navigate(first_key)
+    def _has_permission(self, perm):
+        """Check if user has a specific permission."""
+        if isinstance(perm, tuple):
+            return any(p in self.permissions for p in perm)
+        return perm in self.permissions
+    def navigate(self, page_name: str):
+        """
+        Navigate to a specific page.
+        Args:
+            page_name: Name of the page to navigate to
+        """
+        if self._is_closing:
+            return
+        if page_name == 'logout':
+            self.logout()
+            return
+        if page_name in self.pages:
+            self.stack.setCurrentWidget(self.pages[page_name])
+            if self.sidebar:
+                self.sidebar.set_active(page_name)
+            if self.header:
+                self.header.set_title(page_name.replace('_', ' ').title())
+    def toggle_theme(self):
+        """Toggle between light and dark themes."""
+        if self._is_closing:
+            return
+        self.theme_manager.toggle_theme()
+    def _on_sidebar_toggled(self, expanded: bool):
+        """Handle sidebar toggle."""
+        if self._is_closing:
+            return
+        if self.header:
+            self.header.set_sidebar_expanded(expanded)
+    def global_search(self, text: str):
+        """Handle global search."""
+        if self._is_closing:
+            return
+        if self.stack and self.stack.currentWidget():
+            if hasattr(self.stack.currentWidget(), 'filter_table'):
+                self.stack.currentWidget().filter_table(text)
+    def logout(self):
+        """Log out the current user and return to login page."""
+        if self._is_closing or self._is_logging_out:
+            return
+        self._is_logging_out = True
+        logger.info("Logging out user...")
+        try:
+            if self.sync_manager:
+                try:
+                    self.sync_manager.sync_now()
+                except Exception:
+                    pass
+            self.current_user = None
+            self.permissions = []
+            for page_name, page in list(self.pages.items()):
+                if hasattr(page, 'cleanup'):
+                    try:
+                        page.cleanup()
+                    except Exception:
+                        pass
+                page.deleteLater()
+            self.pages.clear()
+            if self.stack:
+                self.stack.deleteLater()
+                self.stack = None
+            if self.main_central_widget:
+                self.main_central_widget.deleteLater()
+                self.main_central_widget = None
+            self.show_login_page()
+        except Exception as e:
+            logger.error(f"Error during logout: {e}")
+        self._is_logging_out = False
+    def center_window(self):
+        """Center the window on the primary screen."""
+        screen = QApplication.primaryScreen()
+        if screen:
+            geometry = screen.availableGeometry()
+            self.move(geometry.center() - self.rect().center())
+    def closeEvent(self, event):
+        """Handle application close event with proper cleanup."""
+        if self._is_closing:
+            event.accept()
+            return
+        self._is_closing = True
+        logger.info("Application closing...")
+        if self.sync_timer:
+            try:
+                self.sync_timer.stop()
+            except Exception:
+                pass
+            self.sync_timer = None
+        if self.sync_manager:
+            try:
+                self.sync_manager.stop()
+            except Exception:
+                pass
+            self.sync_manager = None
+        if self.api_client:
+            try:
+                self.api_client.shutdown()
+            except Exception:
+                pass
+            self.api_client = None
+        if self.db:
+            try:
+                self.db.close()
+            except Exception:
+                pass
+            self.db = None
+        self.pages.clear()
+        self.stack = None
+        self.main_central_widget = None
+        event.accept()
+    def showEvent(self, event):
+        """Handle show event."""
+        super().showEvent(event)
+        if not self._is_closing:
+            QTimer.singleShot(50, lambda: self._on_theme_changed(self.theme_manager.get_current_theme()))'''
+'''
+"""Main application window and orchestration layer for ICT Authority Access Control."""
+import logging
+from typing import Optional, Dict, List, Any
+from PySide6.QtWidgets import (
+    QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, 
+    QStackedWidget, QApplication, QMessageBox
+)
+from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, Signal
+from widgets.sidebar import Sidebar
+from widgets.header import Header
+from core.theme_manager import ThemeManager
+from pages.dashboard_page import DashboardPage
+from pages.visitors_page import VisitorsPage
+from pages.employees_page import EmployeesPage
+from pages.access_logs_page import AccessLogsPage
+from pages.field_config_page import FieldConfigPage
+from pages.report_page import ReportPage
+from pages.settings_page import SettingsPage
+from database.db_manager import DatabaseManager
+from config import Config
+from widgets.components import ShadcnToast
+from core.api_client import APIClient
+from core.auth_manager import AuthManager
+from core.data_service import DataService
+from core.sync_manager import SyncManager
+from core.env_manager import EnvironmentManager
+logger = logging.getLogger(__name__)
+class MainApp(QMainWindow):
+    """
+    Main application window managing the authenticated session.
+    """
+    logout_requested = Signal()
+    connection_changed = Signal(bool)
+    def __init__(self):
+        super().__init__()
+        self._is_closing = False
+        self.theme_manager = ThemeManager()
+        self.theme_manager.theme_changed.connect(self._on_theme_changed)
+        self.db = DatabaseManager()
+        self.env_manager = EnvironmentManager()
+        self.api_client = APIClient(self.env_manager.get_base_url())
+        self.env_manager.env_changed.connect(self._on_env_changed)
+        self.sync_manager: Optional[SyncManager] = None
+        self.data_service: Optional[DataService] = None
+        self.auth_manager: Optional[AuthManager] = None
+        self.current_user: Optional[Dict[str, Any]] = None
+        self.permissions: List[str] = []
+        self.main_central_widget: Optional[QWidget] = None
+        self.pages: Dict[str, QWidget] = {}
+        self.stack: Optional[QStackedWidget] = None
+        self.sidebar: Optional[Sidebar] = None
+        self.header: Optional[Header] = None
+        self.login_page: Optional[QWidget] = None
+        self.sync_timer: Optional[QTimer] = None
+        self._is_logging_out = False
+        self.show_login_page()
+    def _lazy_init_services(self):
+        """Initialize services only when needed (after login)."""
+        if self._is_closing:
+            return
+        if self.sync_manager is None:
+            logger.info("Initializing backend services...")
+            try:
+                self.sync_manager = SyncManager(self.api_client, self.db)
+                self.sync_manager.start()
+                self.data_service = DataService(self.api_client, self.db, self.sync_manager)
+                self.api_client.connection_changed.connect(self._on_connection_changed)
+                self._setup_auto_sync()
+                logger.info("Services initialized successfully")
+            except Exception as e:
+                logger.error(f"Failed to initialize services: {e}")
+                self._show_toast("Service Initialization", 
+                                "Some services failed to initialize. Some features may be limited.",
+                                "warning")
+    def _show_toast(self, title: str, message: str, variant: str = "default"):
+        """Show a toast notification."""
+        try:
+            ShadcnToast(title, message, variant=variant)
+        except Exception as e:
+            logger.error(f"Failed to show toast: {e}")
+    def _on_theme_changed(self, theme: str):
+        """
+        Handle the single application-wide theme event.
+        ThemeManager has already:
+            - changed the theme
+            - updated tokens
+            - persisted the preference
+            - applied QApplication stylesheet
+        MainApp only handles components that have genuinely
+        theme-dependent resources outside QSS.
+        """
+        if self._is_closing:
+            return
+        logger.debug("Theme changed: %s", theme)
+        if self.header and hasattr(self.header, "on_theme_changed"):
+            self.header.on_theme_changed(theme)
+        if self.sidebar and hasattr(self.sidebar, "on_theme_changed"):
+            self.sidebar.on_theme_changed(theme)
+        if self.stack:
+            current_page = self.stack.currentWidget()
+            if current_page and hasattr(current_page, "on_theme_changed"):
+                try:
+                    current_page.on_theme_changed(theme)
+                except Exception as e:
+                    logger.debug(f"Error updating page theme: {e}")
+    def _on_env_changed(self, new_url: str):
+        """Handle environment URL change."""
+        if self._is_closing:
+            return
+        logger.info(f"Environment changed to: {new_url}")
+        self.api_client.base_url = new_url
+        self.api_client._check_online_status()
+        if self.current_user:
+            self._refresh_after_connection_change()
+    def _on_connection_changed(self, online: bool):
+        """Handle connection status changes."""
+        if self._is_closing:
+            return
+        if online and self.current_user:
+            if self.sync_manager:
+                self.sync_manager.sync()
+            self._refresh_after_connection_change()
+        elif not online:
+            logger.debug("App is offline")
+            self._show_toast("Offline Mode", 
+                            "You are offline. Changes will be synced when connection is restored.",
+                            "warning")
+    def _refresh_after_connection_change(self):
+        """Refresh data after connection change."""
+        if self._is_closing:
+            return
+        if hasattr(self, 'stack') and self.stack:
+            current_widget = self.stack.currentWidget()
+            if hasattr(current_widget, 'refresh_data'):
+                try:
+                    current_widget.refresh_data()
+                except Exception as e:
+                    logger.error(f"Error refreshing data: {e}")
+    def _setup_auto_sync(self):
+        """Setup automatic sync timer with 2-minute interval."""
+        if self._is_closing:
+            return
+        self.sync_timer = QTimer(self)
+        self.sync_timer.timeout.connect(self._auto_sync_check)
+        self.sync_timer.start(120000)  # 2 minutes
+    def _auto_sync_check(self):
+        """Check connection and sync if online."""
+        if self._is_closing:
+            return
+        if self.api_client.is_online() and self.sync_manager:
+            self.sync_manager.sync()
+    def show_login_page(self):
+        """Show the login page with proper cleanup."""
+        if self._is_closing:
+            return
+        if self.login_page:
+            try:
+                self.login_page.deleteLater()
+            except Exception:
+                pass
+            self.login_page = None
+        from pages.login_page import LoginPage
+        if self.auth_manager is None:
+            self.auth_manager = AuthManager(self.api_client, self.db)
+        self.login_page = LoginPage(auth_manager=self.auth_manager)
+        self.login_page.login_successful.connect(self.on_login_success)
+        self.setCentralWidget(self.login_page)
+        self.setWindowTitle("Access Control - Login")
+        self.setMinimumSize(900, 600)
+        self.resize(1100, 700)
+        self.center_window()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.repaint()
+    def on_login_success(self, user_info: Dict[str, Any]):
+        """
+        Handle successful login - use permissions from JWT.
+        Args:
+            user_info: User information including permissions from JWT
+        """
+        if self._is_closing:
+            return
+        logger.info(f"Login successful for user: {user_info.get('username', 'unknown')}")
+        if self.auth_manager:
+            self.permissions = list(self.auth_manager.permissions) if self.auth_manager.permissions else []
+            logger.debug(f"Permissions from auth_manager: {self.permissions}")
+        else:
+            self.permissions = ['view_dashboard']  # Fallback
+            logger.warning("Auth manager not available, using fallback permissions")
+        user_info.setdefault('id', user_info.get('username', 'User'))
+        user_info.setdefault('full_name', user_info.get('username', 'User'))
+        user_info.setdefault('email', '')
+        user_info.setdefault('permissions', self.permissions)
+        self.current_user = user_info
+        self._lazy_init_services()
+        self.build_main_ui(user_info)
+        current_geometry = self.geometry()
+        if self.login_page:
+            self.login_page.hide()
+        self.setCentralWidget(self.main_central_widget)
+        self.setGeometry(current_geometry)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.setWindowOpacity(0.0)
+        self.fade_anim = QPropertyAnimation(self, b"windowOpacity")
+        self.fade_anim.setDuration(400)
+        self.fade_anim.setStartValue(0.0)
+        self.fade_anim.setEndValue(1.0)
+        self.fade_anim.setEasingCurve(QEasingCurve.Type.InCubic)
+        self.fade_anim.start()
+        QTimer.singleShot(500, lambda: self.setWindowOpacity(1.0))
+        if self.login_page:
+            QTimer.singleShot(600, self.login_page.deleteLater)
+        logger.info("Main UI displayed")
+    def build_main_ui(self, user_info: Dict[str, Any]):
+        """
+        Build main UI with lazy page loading.
+        Theme styling is owned by ThemeManager/QApplication.
+        """
+        if self._is_closing:
+            return
+        logger.debug("Building main UI...")
+        logger.debug("Permissions: %s", self.permissions)
+        self.setWindowTitle(f"Access Control System - {user_info['full_name']}")
+        self.setMinimumSize(Config.MIN_WIDTH, Config.MIN_HEIGHT)
+        central = QWidget()
+        central.setObjectName("mainCentralWidget")
+        main_layout = QHBoxLayout(central)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+        self.sidebar = Sidebar(self.permissions, user_info, self.theme_manager)
+        self.sidebar.navigation_requested.connect(self.navigate)
+        self.sidebar.toggled.connect(self._on_sidebar_toggled)
+        main_layout.addWidget(self.sidebar)
+        right_panel = QWidget()
+        right_panel.setObjectName("mainRightPanel")
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(0)
+        self.header = Header(user_info, self.theme_manager, sidebar_expanded=True)
+        self.header.menu_toggled.connect(self.sidebar.toggle_collapse)
+        self.header.logout_requested.connect(self.logout)
+        self.header.search_requested.connect(self.global_search)
+        right_layout.addWidget(self.header)
+        self.stack = QStackedWidget()
+        self.stack.setObjectName("mainStack")
+        self.pages = {}
+        self._load_pages()
+        right_layout.addWidget(self.stack)
+        main_layout.addWidget(right_panel, 1)
+        self.main_central_widget = central
+        logger.debug(f"Main UI built. Pages: {list(self.pages.keys())}")
+    def _load_pages(self):
+        """Load pages based on permissions."""
+        from pages.dashboard_page import DashboardPage
+        from pages.visitors_page import VisitorsPage
+        from pages.employees_page import EmployeesPage
+        from pages.access_logs_page import AccessLogsPage
+        from pages.field_config_page import FieldConfigPage
+        from pages.report_page import ReportPage
+        from pages.settings_page import SettingsPage
+        logger.debug(f"Loading pages with permissions: {self.permissions}")
+        if 'view_dashboard' in self.permissions or not self.permissions:
+            logger.debug("Loading Dashboard page")
+            page = DashboardPage(self.current_user, self.permissions, self.data_service)
+            if hasattr(page, 'navigate_requested'):
+                page.navigate_requested.connect(self.navigate)
+            self.pages['dashboard'] = page
+            self.stack.addWidget(page)
+        if self._has_permission(('manage_visitors', 'view_visitors')):
+            logger.debug("Loading Visitors page")
+            page = VisitorsPage(self.current_user, self.permissions, self.data_service)
+            if hasattr(page, 'navigate_requested'):
+                page.navigate_requested.connect(self.navigate)
+            self.pages['visitors'] = page
+            self.stack.addWidget(page)
+        if self._has_permission(('manage_employees', 'view_employees')):
+            logger.debug("Loading Employees page")
+            page = EmployeesPage(self.current_user, self.permissions, self.data_service)
+            if hasattr(page, 'navigate_requested'):
+                page.navigate_requested.connect(self.navigate)
+            self.pages['employees'] = page
+            self.stack.addWidget(page)
+        if 'view_access_logs' in self.permissions:
+            logger.debug("Loading Access Logs page")
+            page = AccessLogsPage(self.current_user, self.permissions, self.data_service)
+            self.pages['access_logs'] = page
+            self.stack.addWidget(page)
+        if 'configure_fields' in self.permissions:
+            logger.debug("Loading Field Config page")
+            page = FieldConfigPage(self.current_user, self.permissions, self.data_service)
+            self.pages['field_config'] = page
+            self.stack.addWidget(page)
+        if 'view_reports' in self.permissions:
+            logger.debug("Loading Reports page")
+            page = ReportPage(self.current_user, self.permissions, self.data_service)
+            self.pages['reports'] = page
+            self.stack.addWidget(page)
+        if 'manage_settings' in self.permissions:
+            logger.debug("Loading Settings page")
+            page = SettingsPage(
+                self.current_user, 
+                self.permissions, 
+                self.data_service,
+                env_manager=self.env_manager,
+                api_client=self.api_client
+            )
+            self.pages['settings'] = page
+            self.stack.addWidget(page)
+        if 'manage_users' in self.permissions:
+            logger.debug("Loading User Management page")
+            from pages.user_management_page import UserManagementPage
+            page = UserManagementPage(self.current_user, self.permissions, self.data_service)
+            if hasattr(page, 'navigate_requested'):
+                page.navigate_requested.connect(self.navigate)
+            self.pages['users'] = page
+            self.stack.addWidget(page)
+        if self.stack.count() == 0:
+            logger.warning("No pages loaded - showing fallback")
+            from PySide6.QtWidgets import QLabel
+            fallback = QLabel("No permissions assigned.\nPlease contact your administrator.")
+            fallback.setAlignment(Qt.AlignCenter)
+            fallback.setStyleSheet("font-size:18px; color:#64748B; padding:40px;")
+            self.stack.addWidget(fallback)
+        if 'dashboard' in self.pages:
+            self.navigate('dashboard')
+        elif self.pages:
+            first_key = list(self.pages.keys())[0]
+            self.navigate(first_key)
+    def _has_permission(self, perm):
+        """Check if user has a specific permission."""
+        if isinstance(perm, tuple):
+            return any(p in self.permissions for p in perm)
+        return perm in self.permissions
+    def navigate(self, page_name: str):
+        """
+        Navigate to a specific page.
+        Args:
+            page_name: Name of the page to navigate to
+        """
+        if self._is_closing:
+            return
+        if page_name == 'logout':
+            self.logout()
+            return
+        if page_name in self.pages:
+            self.stack.setCurrentWidget(self.pages[page_name])
+            if self.sidebar:
+                self.sidebar.set_active(page_name)
+            if self.header:
+                self.header.set_title(page_name.replace('_', ' ').title())
+    def toggle_theme(self):
+        """Toggle between light and dark themes."""
+        if self._is_closing:
+            return
+        self.theme_manager.toggle_theme()
+    def _on_sidebar_toggled(self, expanded: bool):
+        """Handle sidebar toggle."""
+        if self._is_closing:
+            return
+        if self.header:
+            self.header.set_sidebar_expanded(expanded)
+    def global_search(self, text: str):
+        """Handle global search."""
+        if self._is_closing:
+            return
+        if self.stack and self.stack.currentWidget():
+            if hasattr(self.stack.currentWidget(), 'filter_table'):
+                self.stack.currentWidget().filter_table(text)
+    def logout(self):
+        """Log out the current user and return to login page."""
+        if self._is_closing or self._is_logging_out:
+            return
+        self._is_logging_out = True
+        logger.info("Logging out user...")
+        try:
+            if self.sync_manager:
+                try:
+                    self.sync_manager.sync_now()
+                except Exception:
+                    pass
+            self.current_user = None
+            self.permissions = []
+            for page_name, page in list(self.pages.items()):
+                if hasattr(page, 'cleanup'):
+                    try:
+                        page.cleanup()
+                    except Exception:
+                        pass
+                page.deleteLater()
+            self.pages.clear()
+            if self.stack:
+                self.stack.deleteLater()
+                self.stack = None
+            if self.main_central_widget:
+                self.main_central_widget.deleteLater()
+                self.main_central_widget = None
+            self.show_login_page()
+        except Exception as e:
+            logger.error(f"Error during logout: {e}")
+        self._is_logging_out = False
+    def center_window(self):
+        """Center the window on the primary screen."""
+        screen = QApplication.primaryScreen()
+        if screen:
+            geometry = screen.availableGeometry()
+            self.move(geometry.center() - self.rect().center())
+    def closeEvent(self, event):
+        """Handle application close event with proper cleanup."""
+        if self._is_closing:
+            event.accept()
+            return
+        self._is_closing = True
+        logger.info("Application closing...")
+        if self.sync_timer:
+            try:
+                self.sync_timer.stop()
+            except Exception:
+                pass
+            self.sync_timer = None
+        if self.sync_manager:
+            try:
+                self.sync_manager.stop()
+            except Exception:
+                pass
+            self.sync_manager = None
+        if self.api_client:
+            try:
+                self.api_client.shutdown()
+            except Exception:
+                pass
+            self.api_client = None
+        if self.db:
+            try:
+                self.db.close()
+            except Exception:
+                pass
+            self.db = None
+        self.pages.clear()
+        self.stack = None
+        self.main_central_widget = None
+        event.accept()
+    def showEvent(self, event):
+        """Handle show event."""
+        super().showEvent(event)'''
+'''
+"""Main application window and orchestration layer for ICT Authority Access Control."""
+import logging
+from typing import Optional, Dict, List, Any
+from PySide6.QtWidgets import (
+    QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, 
+    QStackedWidget, QApplication, QMessageBox, QPushButton, QLabel, QLineEdit
+)
+from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, Signal
+from widgets.sidebar import Sidebar
+from widgets.header import Header
+from core.theme_manager import ThemeManager
+from pages.dashboard_page import DashboardPage
+from pages.visitors_page import VisitorsPage
+from pages.employees_page import EmployeesPage
+from pages.access_logs_page import AccessLogsPage
+from pages.field_config_page import FieldConfigPage
+from pages.report_page import ReportPage
+from pages.settings_page import SettingsPage
+from database.db_manager import DatabaseManager
+from config import Config
+from widgets.components import ShadcnToast
+from core.api_client import APIClient
+from core.auth_manager import AuthManager
+from core.data_service import DataService
+from core.sync_manager import SyncManager
+from core.env_manager import EnvironmentManager
+logger = logging.getLogger(__name__)
+class MainApp(QMainWindow):
+    """
+    Main application window managing the authenticated session.
+    """
+    logout_requested = Signal()
+    theme_changed = Signal(str)
+    connection_changed = Signal(bool)
+    def __init__(self):
+        super().__init__()
+        self._is_closing = False
+        self._is_initialized = False
+        self._updating_theme = False
+        self.theme_manager = ThemeManager()
+        self.theme_manager.theme_changed.connect(self._on_theme_changed)
+        self.db = DatabaseManager()
+        self.env_manager = EnvironmentManager()
+        self.api_client = APIClient(self.env_manager.get_base_url())
+        self.env_manager.env_changed.connect(self._on_env_changed)
+        self.sync_manager: Optional[SyncManager] = None
+        self.data_service: Optional[DataService] = None
+        self.auth_manager: Optional[AuthManager] = None
+        self.current_user: Optional[Dict[str, Any]] = None
+        self.permissions: List[str] = []
+        self.main_central_widget: Optional[QWidget] = None
+        self.pages: Dict[str, QWidget] = {}
+        self.stack: Optional[QStackedWidget] = None
+        self.sidebar: Optional[Sidebar] = None
+        self.header: Optional[Header] = None
+        self.login_page: Optional[QWidget] = None
+        self.sync_timer: Optional[QTimer] = None
+        self._is_logging_out = False
+        self.show_login_page()
+    def _lazy_init_services(self):
+        """Initialize services only when needed (after login)."""
+        if self._is_closing:
+            return
+        if self.sync_manager is None:
+            logger.info("Initializing backend services...")
+            try:
+                self.sync_manager = SyncManager(self.api_client, self.db)
+                self.sync_manager.start()
+                self.data_service = DataService(self.api_client, self.db, self.sync_manager)
+                self.api_client.connection_changed.connect(self._on_connection_changed)
+                self._setup_auto_sync()
+                logger.info("Services initialized successfully")
+            except Exception as e:
+                logger.error(f"Failed to initialize services: {e}")
+                self._show_toast("Service Initialization", 
+                                "Some services failed to initialize. Some features may be limited.",
+                                "warning")
+    def _show_toast(self, title: str, message: str, variant: str = "default"):
+        """Show a toast notification."""
+        try:
+            ShadcnToast(title, message, variant=variant)
+        except Exception as e:
+            logger.error(f"Failed to show toast: {e}")
+    def _on_theme_changed(self):
+        """
+        Handle theme change - SINGLE EVENT for all components.
+        All components update simultaneously in one pass.
+        """
+        if self._is_closing or self._updating_theme:
+            return
+        self._updating_theme = True
+        try:
+            theme = self.theme_manager.get_current_theme()
+            logger.debug(f"Theme changed to: {theme}")
+            tokens = self.theme_manager.get_tokens()
+            bg_color = tokens.get('background', '#0B1220')
+            self.theme_manager.blockSignals(True)
+            stylesheet = self.theme_manager.get_stylesheet()
+            self.setStyleSheet(stylesheet)
+            if self.main_central_widget:
+                self.main_central_widget.setStyleSheet(f"background-color: {bg_color};")
+                if self.stack:
+                    self.stack.setStyleSheet(f"background-color: {bg_color};")
+            if self.header:
+                self.header._apply_stylesheet()
+                self.header._refresh_icons()
+                if hasattr(self.header, '_current_page'):
+                    self.header._set_breadcrumb(self.header._current_page)
+                self.header.update()
+            if self.sidebar:
+                self.sidebar._apply_stylesheet()
+                self.sidebar._refresh_icons()
+                self.sidebar.update()
+            for page in self.pages.values():
+                if hasattr(page, 'apply_theme'):
+                    try:
+                        page.apply_theme()
+                    except Exception as e:
+                        pass
+                if hasattr(page, 'refresh_styles'):
+                    try:
+                        page.refresh_styles()
+                    except Exception:
+                        pass
+            for widget in self.findChildren(QWidget):
+                try:
+                    widget.style().unpolish(widget)
+                    widget.style().polish(widget)
+                except Exception:
+                    pass
+            self.theme_manager.blockSignals(False)
+            self.update()
+            QApplication.processEvents()
+            logger.debug(f"Theme update complete: {theme}")
+        except Exception as e:
+            logger.error(f"Error during theme refresh: {e}")
+            self.theme_manager.blockSignals(False)
+        finally:
+            self._updating_theme = False
+    def _on_env_changed(self, new_url: str):
+        """Handle environment URL change."""
+        if self._is_closing:
+            return
+        logger.info(f"Environment changed to: {new_url}")
+        self.api_client.base_url = new_url
+        self.api_client._check_online_status()
+        if self.current_user:
+            self._refresh_after_connection_change()
+    def _on_connection_changed(self, online: bool):
+        """Handle connection status changes."""
+        if self._is_closing:
+            return
+        if online and self.current_user:
+            if self.sync_manager:
+                self.sync_manager.sync()
+            self._refresh_after_connection_change()
+        elif not online:
+            logger.debug("App is offline")
+            self._show_toast("Offline Mode", 
+                            "You are offline. Changes will be synced when connection is restored.",
+                            "warning")
+    def _refresh_after_connection_change(self):
+        """Refresh data after connection change."""
+        if self._is_closing:
+            return
+        if hasattr(self, 'stack') and self.stack:
+            current_widget = self.stack.currentWidget()
+            if hasattr(current_widget, 'refresh_data'):
+                try:
+                    current_widget.refresh_data()
+                except Exception as e:
+                    logger.error(f"Error refreshing data: {e}")
+    def _setup_auto_sync(self):
+        """Setup automatic sync timer with 2-minute interval."""
+        if self._is_closing:
+            return
+        self.sync_timer = QTimer(self)
+        self.sync_timer.timeout.connect(self._auto_sync_check)
+        self.sync_timer.start(120000)  # 2 minutes
+    def _auto_sync_check(self):
+        """Check connection and sync if online."""
+        if self._is_closing:
+            return
+        if self.api_client.is_online() and self.sync_manager:
+            self.sync_manager.sync()
+    def show_login_page(self):
+        """Show the login page with proper cleanup."""
+        if self._is_closing:
+            return
+        if self.login_page:
+            try:
+                self.login_page.deleteLater()
+            except Exception:
+                pass
+            self.login_page = None
+        from pages.login_page import LoginPage
+        if self.auth_manager is None:
+            self.auth_manager = AuthManager(self.api_client, self.db)
+        self.login_page = LoginPage(auth_manager=self.auth_manager)
+        self.login_page.login_successful.connect(self.on_login_success)
+        self.setCentralWidget(self.login_page)
+        self.setWindowTitle("Access Control - Login")
+        self.setMinimumSize(900, 600)
+        self.resize(1100, 700)
+        self.center_window()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.repaint()
+        QApplication.processEvents()
+    def on_login_success(self, user_info: Dict[str, Any]):
+        """
+        Handle successful login - use permissions from JWT.
+        Args:
+            user_info: User information including permissions from JWT
+        """
+        if self._is_closing:
+            return
+        logger.info(f"Login successful for user: {user_info.get('username', 'unknown')}")
+        if self.auth_manager:
+            self.permissions = list(self.auth_manager.permissions) if self.auth_manager.permissions else []
+            logger.debug(f"Permissions from auth_manager: {self.permissions}")
+        else:
+            self.permissions = ['view_dashboard']  # Fallback
+            logger.warning("Auth manager not available, using fallback permissions")
+        user_info.setdefault('id', user_info.get('username', 'User'))
+        user_info.setdefault('full_name', user_info.get('username', 'User'))
+        user_info.setdefault('email', '')
+        user_info.setdefault('permissions', self.permissions)
+        self.current_user = user_info
+        self._lazy_init_services()
+        self.build_main_ui(user_info)
+        current_geometry = self.geometry()
+        if self.login_page:
+            self.login_page.hide()
+        self.setCentralWidget(self.main_central_widget)
+        self.setGeometry(current_geometry)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        QApplication.processEvents()
+        self.setWindowOpacity(0.0)
+        self.fade_anim = QPropertyAnimation(self, b"windowOpacity")
+        self.fade_anim.setDuration(400)
+        self.fade_anim.setStartValue(0.0)
+        self.fade_anim.setEndValue(1.0)
+        self.fade_anim.setEasingCurve(QEasingCurve.Type.InCubic)
+        self.fade_anim.start()
+        QTimer.singleShot(500, lambda: self.setWindowOpacity(1.0))
+        if self.login_page:
+            QTimer.singleShot(600, self.login_page.deleteLater)
+        self._on_theme_changed()
+        logger.info("Main UI displayed")
+    def build_main_ui(self, user_info: Dict[str, Any]):
+        """
+        Build main UI with lazy page loading.
+        Args:
+            user_info: User information
+        """
+        if self._is_closing:
+            return
+        logger.debug("Building main UI...")
+        logger.debug(f"Permissions: {self.permissions}")
+        self.setWindowTitle(f"Access Control System - {user_info['full_name']}")
+        self.setMinimumSize(Config.MIN_WIDTH, Config.MIN_HEIGHT)
+        tokens = self.theme_manager.get_tokens()
+        bg_color = tokens.get('background', '#0B1220')
+        central = QWidget()
+        central.setStyleSheet(f"background-color: {bg_color};")
+        main_layout = QHBoxLayout(central)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+        self.sidebar = Sidebar(self.permissions, user_info, self.theme_manager)
+        self.sidebar.navigation_requested.connect(self.navigate)
+        self.sidebar.toggled.connect(self._on_sidebar_toggled)
+        main_layout.addWidget(self.sidebar)
+        right_panel = QWidget()
+        right_panel.setStyleSheet(f"background-color: {bg_color};")
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(0)
+        self.header = Header(user_info, self.theme_manager, sidebar_expanded=True)
+        self.header.menu_toggled.connect(self.sidebar.toggle_collapse)
+        self.header.logout_requested.connect(self.logout)
+        self.header.search_requested.connect(self.global_search)
+        right_layout.addWidget(self.header)
+        self.stack = QStackedWidget()
+        self.stack.setStyleSheet(f"background-color: {bg_color};")
+        self.pages = {}
+        self._load_pages()
+        right_layout.addWidget(self.stack)
+        main_layout.addWidget(right_panel, 1)
+        self.apply_theme()
+        self.main_central_widget = central
+        logger.debug(f"Main UI built. Pages: {list(self.pages.keys())}")
+    def _load_pages(self):
+        """Load pages based on permissions."""
+        from pages.dashboard_page import DashboardPage
+        from pages.visitors_page import VisitorsPage
+        from pages.employees_page import EmployeesPage
+        from pages.access_logs_page import AccessLogsPage
+        from pages.field_config_page import FieldConfigPage
+        from pages.report_page import ReportPage
+        from pages.settings_page import SettingsPage
+        logger.debug(f"Loading pages with permissions: {self.permissions}")
+        if 'view_dashboard' in self.permissions or not self.permissions:
+            logger.debug("Loading Dashboard page")
+            page = DashboardPage(self.current_user, self.permissions, self.data_service)
+            if hasattr(page, 'navigate_requested'):
+                page.navigate_requested.connect(self.navigate)
+            self.pages['dashboard'] = page
+            self.stack.addWidget(page)
+        if self._has_permission(('manage_visitors', 'view_visitors')):
+            logger.debug("Loading Visitors page")
+            page = VisitorsPage(self.current_user, self.permissions, self.data_service)
+            if hasattr(page, 'navigate_requested'):
+                page.navigate_requested.connect(self.navigate)
+            self.pages['visitors'] = page
+            self.stack.addWidget(page)
+        if self._has_permission(('manage_employees', 'view_employees')):
+            logger.debug("Loading Employees page")
+            page = EmployeesPage(self.current_user, self.permissions, self.data_service)
+            if hasattr(page, 'navigate_requested'):
+                page.navigate_requested.connect(self.navigate)
+            self.pages['employees'] = page
+            self.stack.addWidget(page)
+        if 'view_access_logs' in self.permissions:
+            logger.debug("Loading Access Logs page")
+            page = AccessLogsPage(self.current_user, self.permissions, self.data_service)
+            self.pages['access_logs'] = page
+            self.stack.addWidget(page)
+        if 'configure_fields' in self.permissions:
+            logger.debug("Loading Field Config page")
+            page = FieldConfigPage(self.current_user, self.permissions, self.data_service)
+            self.pages['field_config'] = page
+            self.stack.addWidget(page)
+        if 'view_reports' in self.permissions:
+            logger.debug("Loading Reports page")
+            page = ReportPage(self.current_user, self.permissions, self.data_service)
+            self.pages['reports'] = page
+            self.stack.addWidget(page)
+        if 'manage_settings' in self.permissions:
+            logger.debug("Loading Settings page")
+            page = SettingsPage(
+                self.current_user, 
+                self.permissions, 
+                self.data_service,
+                env_manager=self.env_manager,
+                api_client=self.api_client
+            )
+            self.pages['settings'] = page
+            self.stack.addWidget(page)
+        if 'manage_users' in self.permissions:
+            logger.debug("Loading User Management page")
+            from pages.user_management_page import UserManagementPage
+            page = UserManagementPage(self.current_user, self.permissions, self.data_service)
+            if hasattr(page, 'navigate_requested'):
+                page.navigate_requested.connect(self.navigate)
+            self.pages['users'] = page
+            self.stack.addWidget(page)
+        if self.stack.count() == 0:
+            logger.warning("No pages loaded - showing fallback")
+            from PySide6.QtWidgets import QLabel
+            fallback = QLabel("No permissions assigned.\nPlease contact your administrator.")
+            fallback.setAlignment(Qt.AlignCenter)
+            fallback.setStyleSheet("font-size:18px; color:#64748B; padding:40px;")
+            self.stack.addWidget(fallback)
+        if 'dashboard' in self.pages:
+            self.navigate('dashboard')
+        elif self.pages:
+            first_key = list(self.pages.keys())[0]
+            self.navigate(first_key)
+    def _has_permission(self, perm):
+        """Check if user has a specific permission."""
+        if isinstance(perm, tuple):
+            return any(p in self.permissions for p in perm)
+        return perm in self.permissions
+    def navigate(self, page_name: str):
+        """
+        Navigate to a specific page.
+        Args:
+            page_name: Name of the page to navigate to
+        """
+        if self._is_closing:
+            return
+        if page_name == 'logout':
+            self.logout()
+            return
+        if page_name in self.pages:
+            self.stack.setCurrentWidget(self.pages[page_name])
+            if self.sidebar:
+                self.sidebar.set_active(page_name)
+            if self.header:
+                self.header.set_title(page_name.replace('_', ' ').title())
+    def toggle_theme(self):
+        """Toggle between light and dark themes."""
+        if self._is_closing:
+            return
+        self.theme_manager.toggle_theme()
+    def _on_sidebar_toggled(self, expanded: bool):
+        """Handle sidebar toggle."""
+        if self._is_closing:
+            return
+        if self.header:
+            self.header.set_sidebar_expanded(expanded)
+    def apply_theme(self):
+        """Apply the current theme to the application."""
+        if self._is_closing:
+            return
+        stylesheet = self.theme_manager.get_stylesheet()
+        self.setStyleSheet(stylesheet)
+        tokens = self.theme_manager.get_tokens()
+        bg_color = tokens.get('background', '#0B1220')
+        if self.main_central_widget:
+            self.main_central_widget.setStyleSheet(f"background-color: {bg_color};")
+            for child in self.main_central_widget.findChildren(QWidget):
+                if self.stack and child is self.stack:
+                    self.stack.setStyleSheet(f"background-color: {bg_color};")
+        self.update()
+        QApplication.processEvents()
+    def global_search(self, text: str):
+        """Handle global search."""
+        if self._is_closing:
+            return
+        if self.stack and self.stack.currentWidget():
+            if hasattr(self.stack.currentWidget(), 'filter_table'):
+                self.stack.currentWidget().filter_table(text)
+    def logout(self):
+        """Log out the current user and return to login page."""
+        if self._is_closing or self._is_logging_out:
+            return
+        self._is_logging_out = True
+        logger.info("Logging out user...")
+        try:
+            if self.sync_manager:
+                try:
+                    self.sync_manager.sync_now()
+                except Exception:
+                    pass
+            self.current_user = None
+            self.permissions = []
+            for page_name, page in list(self.pages.items()):
+                if hasattr(page, 'cleanup'):
+                    try:
+                        page.cleanup()
+                    except Exception:
+                        pass
+                page.deleteLater()
+            self.pages.clear()
+            if self.stack:
+                self.stack.deleteLater()
+                self.stack = None
+            if self.main_central_widget:
+                self.main_central_widget.deleteLater()
+                self.main_central_widget = None
+            self.show_login_page()
+        except Exception as e:
+            logger.error(f"Error during logout: {e}")
+        self._is_logging_out = False
+    def center_window(self):
+        """Center the window on the primary screen."""
+        screen = QApplication.primaryScreen()
+        if screen:
+            geometry = screen.availableGeometry()
+            self.move(geometry.center() - self.rect().center())
+    def closeEvent(self, event):
+        """Handle application close event with proper cleanup."""
+        if self._is_closing:
+            event.accept()
+            return
+        self._is_closing = True
+        logger.info("Application closing...")
+        if self.sync_timer:
+            try:
+                self.sync_timer.stop()
+            except Exception:
+                pass
+            self.sync_timer = None
+        if self.sync_manager:
+            try:
+                self.sync_manager.stop()
+            except Exception:
+                pass
+            self.sync_manager = None
+        if self.api_client:
+            try:
+                self.api_client.shutdown()
+            except Exception:
+                pass
+            self.api_client = None
+        if self.db:
+            try:
+                self.db.close()
+            except Exception:
+                pass
+            self.db = None
+        self.pages.clear()
+        self.stack = None
+        self.main_central_widget = None
+        event.accept()
+    def showEvent(self, event):
+        """Handle show event - ensure theme is applied."""
+        super().showEvent(event)
+        if not self._is_closing:
+            QTimer.singleShot(100, self._on_theme_changed)'''
